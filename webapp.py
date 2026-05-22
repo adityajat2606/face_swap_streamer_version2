@@ -262,6 +262,64 @@ def _spawn_ffmpeg(job: Job, w: int, h: int, fps: float) -> subprocess.Popen:
     return proc
 
 
+def _match_faces_to_sources(sims, tgt_faces, thresh):
+    """Decide which detected face is swapped with which source per frame.
+
+    ``sims`` is a (T_faces, S_sources) similarity matrix (NN-over-cluster-
+    members). Returns a list of ``(face, source_index)`` to swap.
+
+    Why not plain per-face argmax (the old logic): with a male + female source,
+    argmax independently picks the best source for each face and threshold-gates
+    it. If the female reference is even slightly weaker, BOTH the male and female
+    target faces argmax to the male source (or the female face falls below
+    threshold), the female source is never used, and the actress's face is left
+    unswapped — exactly the "female face skipped" bug.
+
+    Fix: a one-to-one assignment.
+      * When #faces == #sources (the duet case: one male + one female lead),
+        force each source onto a distinct face by greedy max-similarity, with NO
+        threshold — we KNOW each source maps to one of the people on screen, so
+        every face is swapped and no source is left unused.
+      * Otherwise (crowd / a lead absent), match each source to its best
+        DISTINCT face above threshold, then let any remaining face swap with its
+        best source above threshold (handles repeated identities) — and never
+        force a source onto a face it doesn't match (an absent lead stays
+        absent).
+    """
+    import numpy as _np
+
+    T, S = sims.shape
+    picks = []
+    face_taken = [False] * T
+    src_used = [False] * S
+    force = (T == S)  # duet: guarantee every source is applied
+
+    # Highest-similarity (face, source) pairs first.
+    order = _np.dstack(
+        _np.unravel_index(_np.argsort(sims, axis=None)[::-1], sims.shape)
+    )[0]
+    for pair in order:
+        ti, si = int(pair[0]), int(pair[1])
+        if face_taken[ti] or src_used[si]:
+            continue
+        if (not force) and float(sims[ti, si]) < thresh:
+            break
+        picks.append((tgt_faces[ti], si))
+        face_taken[ti] = True
+        src_used[si] = True
+        if all(src_used) or all(face_taken):
+            break
+
+    # Extra faces (same identity appearing more than once) -> best source.
+    for ti in range(T):
+        if face_taken[ti]:
+            continue
+        si = int(_np.argmax(sims[ti]))
+        if float(sims[ti, si]) >= thresh:
+            picks.append((tgt_faces[ti], si))
+    return picks
+
+
 def _run_job(job: Job):
     ffmpeg = None
     try:
@@ -534,10 +592,7 @@ def _run_job(job: Job):
                                     sims[:, s] = all_sims[:, cols].max(axis=1)
                         else:
                             sims = tgt_embs @ ref_embs.T              # fallback: centroid sim
-                        for ti, tface in enumerate(tgt_faces):
-                            si = int(np.argmax(sims[ti]))
-                            if float(sims[ti, si]) >= REFERENCE_THRESH:
-                                picks.append((tface, si))
+                        picks = _match_faces_to_sources(sims, tgt_faces, REFERENCE_THRESH)
                     detect_q.put((frame, picks))
             finally:
                 detect_q.put(END)

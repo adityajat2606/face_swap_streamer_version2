@@ -229,6 +229,46 @@ class FramePool:
 # FACESWAP_ENHANCER=0 disables GFPGAN. Prod (v1) is unaffected.
 
 
+def _match_faces_to_sources(sims, thresh):
+    """One-to-one face<->source assignment per frame. Returns [(face_i, src_i)].
+
+    Replaces plain per-face argmax, which left the female source unused (and the
+    actress's face skipped) whenever the male match was stronger. When #faces ==
+    #sources (the duet case) every source is forced onto a distinct face with no
+    threshold, so the female face is always swapped; otherwise each source claims
+    its best distinct face above threshold, then extra faces match their best
+    source above threshold (crowds / repeated identities).
+    """
+    import numpy as _np
+
+    T, S = sims.shape
+    out = []
+    face_taken = [False] * T
+    src_used = [False] * S
+    force = (T == S)
+    order = _np.dstack(
+        _np.unravel_index(_np.argsort(sims, axis=None)[::-1], sims.shape)
+    )[0]
+    for pair in order:
+        ti, si = int(pair[0]), int(pair[1])
+        if face_taken[ti] or src_used[si]:
+            continue
+        if (not force) and float(sims[ti, si]) < thresh:
+            break
+        out.append((ti, si))
+        face_taken[ti] = True
+        src_used[si] = True
+        if all(src_used) or all(face_taken):
+            break
+    for ti in range(T):
+        if face_taken[ti]:
+            continue
+        si = int(_np.argmax(sims[ti]))
+        if float(sims[ti, si]) >= thresh:
+            out.append((ti, si))
+    return out
+
+
 def _color_transfer(src, ref, strength, np, cv2):
     """Match `src`'s colour statistics to `ref` in LAB (Reinhard transfer).
 
@@ -603,36 +643,35 @@ def worker_main(
                                 sims[:, s] = all_sims[:, cols].max(axis=1)
                     else:
                         sims = tgt_embs @ ref_embs_T      # fallback to centroid sim
-                    for ti, tface in enumerate(tgt_faces):
-                        si = int(np.argmax(sims[ti]))
-                        if float(sims[ti, si]) >= ref_thresh:
-                            src_face = ref_sources[si]["src_face"]
-                            if enh["enhance"]:
-                                # Custom paste: get the raw 128px swap + affine
-                                # matrix, colour-match it to the target lighting
-                                # and sharpen, then paste back ourselves.
-                                bgr_fake, M = sw.get(frame, tface, src_face,
-                                                     paste_back=False)
-                                aimg, _ = face_align.norm_crop2(
-                                    frame, tface.kps, swap_size)
-                                frame[...] = _paste_enhanced(
-                                    frame, aimg, bgr_fake, M, enh, np, cv2)
-                                # GFPGAN restoration on the just-swapped face,
-                                # but only when the face is large enough to
-                                # benefit — skipping tiny faces is the main
-                                # FPS lever in multi-face / crowd scenes.
-                                if enh["enhancer"] is not None:
-                                    x1, y1, x2, y2 = tface.bbox
-                                    face_px = max(x2 - x1, y2 - y1)
-                                    if face_px >= enh["enhancer_min_face"]:
-                                        frame[...] = enh["enhancer"].enhance(
-                                            frame, tface.kps, enh["enhancer_blend"])
-                            else:
-                                # Stock inswapper fused swap+paste (byte-for-byte
-                                # identical to the Phase 2 path). FACESWAP_ENHANCE=0.
-                                frame[...] = sw.get(frame, tface, src_face,
-                                                    paste_back=True)
-                            n_swapped += 1
+                    for ti, si in _match_faces_to_sources(sims, ref_thresh):
+                        tface = tgt_faces[ti]
+                        src_face = ref_sources[si]["src_face"]
+                        if enh["enhance"]:
+                            # Custom paste: get the raw 128px swap + affine
+                            # matrix, colour-match it to the target lighting
+                            # and sharpen, then paste back ourselves.
+                            bgr_fake, M = sw.get(frame, tface, src_face,
+                                                 paste_back=False)
+                            aimg, _ = face_align.norm_crop2(
+                                frame, tface.kps, swap_size)
+                            frame[...] = _paste_enhanced(
+                                frame, aimg, bgr_fake, M, enh, np, cv2)
+                            # GFPGAN restoration on the just-swapped face,
+                            # but only when the face is large enough to
+                            # benefit — skipping tiny faces is the main
+                            # FPS lever in multi-face / crowd scenes.
+                            if enh["enhancer"] is not None:
+                                x1, y1, x2, y2 = tface.bbox
+                                face_px = max(x2 - x1, y2 - y1)
+                                if face_px >= enh["enhancer_min_face"]:
+                                    frame[...] = enh["enhancer"].enhance(
+                                        frame, tface.kps, enh["enhancer_blend"])
+                        else:
+                            # Stock inswapper fused swap+paste (byte-for-byte
+                            # identical to the Phase 2 path). FACESWAP_ENHANCE=0.
+                            frame[...] = sw.get(frame, tface, src_face,
+                                                paste_back=True)
+                        n_swapped += 1
 
                 elapsed = (time.perf_counter() - tA) * 1000.0
                 out_q.put(SwapResponse(
