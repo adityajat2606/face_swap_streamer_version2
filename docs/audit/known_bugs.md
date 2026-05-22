@@ -32,15 +32,36 @@ Defaults implemented; owner confirmation pending at the noted milestone:
 | Q6 | 3+ faces | top-2 by area matched, rest pass through |
 | Q8 | Final codec | H.264 CRF 16 |
 
-## Deferred to later milestones
+## Engine swap pipeline — now WIRED (was placeholder)
 
-- **Optical-flow motion compensation in the live Flicker measurement** — the
-  `flicker.warp_face_to_prev` plumbing exists; wiring RAFT output into the
-  per-frame metric on the GPU host is Milestone 4 work.
+The engine's runner is no longer a passthrough. It now does, end to end:
+detect → gender-aware reference routing (`reference_extractor` +
+`matching.assign_sources_to_clusters`) → sticky temporal matching
+(`matching.SourceTracker`) → colour-matched feathered swap (`swap_engine` +
+`blend`) → One-Euro landmark smoothing → per-frame Flicker Score (`flicker`) →
+PASS/WARN/FAIL → retry with reduced restoration on FAIL → checkpoint/resume →
+reports → debug dumps. The pure parts (blend, matching, clustering) are CPU
+unit-tested; the GPU path is validated on the RTX box via `docs/RUNBOOK.md`.
+
+## Still approximate / follow-up
+
+- **Flicker `embedding` component = 0** in the live metric — computing a
+  swapped-face ArcFace embedding every frame ~doubles detector cost; the other
+  four components (color/landmark/mask/sharpness) are computed for real. Turn on
+  if §4A identity-stability KPIs require it.
+- **Retry exercises the restoration-strength strategy** (the dominant flicker
+  source, §41) rather than all nine §30 strategies. The strategy table exists in
+  `quality_validator`; wiring the remaining strategies to real re-swaps is a
+  bounded follow-up.
+- **Optical-flow motion compensation** before the Flicker metric (§15.3) —
+  `flicker.warp_face_to_prev` + `stabilizer/flow` plumbing exists; RAFT wiring
+  into the live metric is optional P1 work.
 - **Flicker weight calibration (§15.4)** — needs 200 human-rubric-scored frames.
-  Default weights `(0.30, 0.20, 0.20, 0.15, 0.15)` are the pre-calibration prior.
 - **Interactive `assign-identities` resolver** — raises `NotImplementedError`;
-  the GPU host renders keyframes and writes `identity_map.yaml` (Milestone 3).
-- **Real swap bridging in `runner._swap_and_stabilize`** — currently a
-  passthrough placeholder; the GPU host bridges insightface Face objects into
-  `Swapper.swap` (Milestone 3/6).
+  routing currently auto-assigns by gender + embedding clusters.
+
+## Can only be done on the GPU box (not code — see docs/RUNBOOK.md)
+
+- §35A baseline numbers, §4A KPI measurement, §37 human evaluation, and the
+  byte-identical-resume verification all require the RTX box + real clips +
+  reviewers.

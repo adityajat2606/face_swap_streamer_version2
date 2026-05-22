@@ -8,6 +8,7 @@ lazily (GPU host only). The loop is written to spec; it runs on the RTX target.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -16,16 +17,14 @@ import numpy as np
 
 from .checkpoint import CheckpointState, clear_checkpoint, write_checkpoint
 from .config import Config
-from .errors import AmbiguousIdentityError
 from .gpu_telemetry import GpuTelemetry
-from .identity_manager import assign_identities, load_identity
 from .logging_setup import bind_run_context, get_logger
 from .manifest import sha256_file_or_none
 from .observability import Observatory
-from .quality_validator import FrameContext, evaluate_with_retry
 from .report_generator import compute_kpis, read_quality_jsonl
 from .temporal_stabilizer import Stabilizer
 from .tracker import Tracker
+from .types import FrameResult
 
 _log = get_logger("face_swap.runner")
 
@@ -60,10 +59,9 @@ class StageRunner:
         self._elapsed_offset = state.elapsed_seconds
         np.random.seed(state.random_seed)
 
-    # ---- model loading ------------------------------------------------
+    # ---- model loading + identity routing -----------------------------
     def _load_models(self) -> None:
         from .face_detector import Detector
-        from .restoration_engine import Restorer
         from .swap_engine import Swapper
 
         with self.obs.span("load_models"):
@@ -74,29 +72,55 @@ class StageRunner:
             self._detector.load()
             self._swapper = Swapper()
             self._swapper.load()
-            if self.cfg.restoration.enabled:
-                self._restorer = Restorer(max_strength=self.cfg.restoration.max_strength)
-                # GFPGAN weights are optional; load is best-effort.
-                try:
-                    self._restorer.load()
-                except Exception as exc:  # noqa: BLE001
-                    _log.warning("restoration_unavailable", error=str(exc))
-                    self._restorer = None
 
-    # ---- identities ---------------------------------------------------
-    def _load_identities(self) -> tuple[np.ndarray, np.ndarray]:
-        hero = load_identity(self._detector.embed_reference, str(self.cfg.input.hero_reference))
-        heroine = load_identity(self._detector.embed_reference, str(self.cfg.input.heroine_reference))
-        return hero, heroine
+    def _detect_source_face(self, path: str):
+        """Largest insightface Face in a reference photo — the identity to paste."""
+        import cv2
+
+        from .errors import InputError
+
+        img = cv2.imread(path)
+        if img is None:
+            raise InputError(f"cannot read reference image: {path}")
+        faces = self._detector.app.get(img)
+        if not faces:
+            raise InputError(f"no face in reference image: {path}")
+        return max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+
+    def _prepare_identities(self) -> None:
+        """Load the new-identity source faces and extract the video's own
+        identity clusters to route each source onto the right person (FR-4)."""
+        from .reference_extractor import extract_references
+
+        srcs = [str(self.cfg.input.hero_reference), str(self.cfg.input.heroine_reference)]
+        self._source_faces = [self._detect_source_face(p) for p in srcs]
+        genders = [f.sex for f in self._source_faces]
+        with self.obs.span("extract_references"):
+            self._references = extract_references(
+                self._detector, str(self.cfg.input.video_path), genders,
+                sample_sec=1.0, max_samples=300,
+            )
+        mem = [r["ref_members"] for r in self._references]
+        self._members_T = np.concatenate(mem, axis=0).astype(np.float32).T  # (D, total)
+        self._members_src_idx = np.concatenate(
+            [np.full(len(r["ref_members"]), si, np.int32) for si, r in enumerate(self._references)]
+        )
+        self._prev: dict = {}  # si -> {crop, kps, mask} for flicker measurement
+        self._write_identity_map(
+            {si: r["gender"] for si, r in enumerate(self._references)}
+        )
 
     # ---- main loop ----------------------------------------------------
     def execute(self, start_frame: int = 0) -> dict:
-        np.random.seed(self.cfg.processing.random_seed)
-        self._load_models()
-        hero_emb, heroine_emb = self._load_identities()
+        import cv2
 
         from . import video_manager
         from .frame_store import FrameStore, extract_ffv1, extract_png_sequence
+        from .matching import SourceTracker
+
+        np.random.seed(self.cfg.processing.random_seed)
+        self._load_models()
+        self._prepare_identities()
 
         meta = video_manager.probe(str(self.cfg.input.video_path))
         self.manifest["source_video"]["meta"] = {
@@ -118,6 +142,9 @@ class StageRunner:
         out_frames_dir = self.dirs.frames / "swapped"
         out_frames_dir.mkdir(parents=True, exist_ok=True)
 
+        ref_thresh = float(os.getenv("FACESWAP_REF_THRESH", "0.15"))
+        self._matcher = SourceTracker(len(self._references), ref_thresh)
+
         gpu = GpuTelemetry(self.dirs.gpu_csv, self.obs.metrics, hz=self.cfg.telemetry.gpu_poll_hz)
         if self.cfg.telemetry.gpu_telemetry:
             gpu.start()
@@ -126,8 +153,7 @@ class StageRunner:
         mode = "a" if start_frame > 0 else "w"
         try:
             with self.dirs.quality_jsonl.open(mode, encoding="utf-8") as qfh:
-                self._frame_loop(store, out_frames_dir, meta, hero_emb, heroine_emb,
-                                 start_frame, qfh)
+                self._frame_loop(store, out_frames_dir, meta, start_frame, qfh, cv2)
         finally:
             gpu.stop()
 
@@ -139,66 +165,156 @@ class StageRunner:
                   frames=kpis.get("n_frames", 0))
         return kpis
 
-    def _frame_loop(self, store, out_dir, meta, hero_emb, heroine_emb, start_frame, qfh):
-        from . import flicker
+    def _build_sims(self, dets):
+        """(T_faces, S_sources) NN-over-cluster-members similarity + bboxes."""
+        embs = np.stack([np.asarray(f.normed_embedding, np.float32) for f in dets])
+        all_sims = embs @ self._members_T  # (T, total_members)
+        S = len(self._references)
+        sims = np.full((len(dets), S), -1.0, np.float32)
+        for s in range(S):
+            cols = self._members_src_idx == s
+            if cols.any():
+                sims[:, s] = all_sims[:, cols].max(axis=1)
+        bboxes = [np.asarray(f.bbox, np.float32) for f in dets]
+        return sims, bboxes
 
-        identities_assigned = False
+    def _frame_loop(self, store, out_dir, meta, start_frame, qfh, cv2):
         ckpt_every = self.cfg.processing.checkpoint_every_n_frames
         max_retry = self.cfg.processing.max_retry_per_frame
-        weights = self.cfg.stabilization.flicker_weights
+        base_sharpen = self.cfg.restoration.max_strength * 0.6 if self.cfg.restoration.enabled else 0.0
 
         for frame_idx, frame in store.iter_frames(start_frame):
             bind_run_context(frame_idx=frame_idx, stage="frame")
             t0 = time.perf_counter()
             with self.obs.span("frame", frame_idx=frame_idx):
-                detections = self._detector.detect(frame, frame_idx)
-                tracks = self.tracker.update(detections, frame_idx)
-
-                if not identities_assigned and frame_idx - start_frame >= 30:
-                    try:
-                        mapping = assign_identities(self.tracker.active_tracks(),
-                                                    hero_emb, heroine_emb)
-                        self.tracker.apply_identity_map(mapping)
-                        self._write_identity_map(mapping)
-                        identities_assigned = True
-                    except AmbiguousIdentityError as exc:
-                        _log.warning("identity_ambiguous", frame_idx=frame_idx, error=str(exc))
-
-                swapped = self._swap_and_stabilize(frame, detections, tracks, frame_idx,
-                                                   hero_emb, heroine_emb)
-
-                ctx = self._make_frame_context(frame_idx, swapped, frame, weights, flicker)
-                result = evaluate_with_retry(frame_idx, ctx, max_retry)
+                dets = self._detector.app.get(frame)
+                picks = []
+                if dets:
+                    sims, bboxes = self._build_sims(dets)
+                    picks = [(dets[fi], si) for fi, si in self._matcher.match(sims, bboxes)]
+                    picks = self._smooth_picks(picks, frame_idx, meta.fps)
+                result, out_frame = self._process_with_retry(
+                    frame, picks, frame_idx, base_sharpen, max_retry, cv2)
 
             result = result.replace(duration_ms=(time.perf_counter() - t0) * 1000.0,
                                     vram_peak_mb=int(self.obs.metrics.gauge("vram_used_mb")))
-            self._record_frame(result, qfh, out_dir, frame_idx, swapped)
-
+            self._record_frame(result, qfh, out_dir, frame_idx, out_frame, cv2)
             if (frame_idx + 1) % ckpt_every == 0:
                 self._checkpoint(frame_idx)
 
-    def _swap_and_stabilize(self, frame, detections, tracks, frame_idx, hero_emb, heroine_emb):
-        """Swap matching faces and re-derive masks from smoothed landmarks."""
-        # NOTE: bridging insightface Face objects to engine calls happens here on
-        # the GPU host; on the spec path the detector exposes raw faces.
-        return frame  # placeholder identity transform; real swap on GPU host
+    def _smooth_picks(self, picks, frame_idx, fps):
+        """One-Euro smooth each matched face's landmarks before the swap (FR-8)
+        to remove sub-pixel jitter of the swap region."""
+        if not self.cfg.stabilization.enabled:
+            return picks
+        from .types import Landmarks
 
-    def _make_frame_context(self, frame_idx, swapped, original, weights, flicker_mod) -> FrameContext:
-        def metrics_fn(_ctx: FrameContext) -> dict[str, float]:
-            # Compare swapped face region to previous frame's, motion-compensated.
-            # On CPU/no-prev this yields zeros (a benign PASS); the GPU host fills it.
-            comps = dict.fromkeys(flicker_mod.COMPONENT_KEYS, 0.0)
-            fs = flicker_mod.flicker_score(comps, weights)
-            return {**comps, "flicker_score": fs, "detection_confidence": 1.0,
-                    "landmark_confidence": 1.0, "identity_consistency": 1.0,
-                    "mask_instability": 0.0}
+        t = frame_idx / max(fps, 1.0)
+        for face, si in picks:
+            try:
+                sm = self.stabilizer.smooth_landmarks(si, Landmarks(np.asarray(face.kps, np.float32)), t)
+                face.kps = sm.points
+            except Exception:  # noqa: BLE001 - smoothing must never break the swap
+                pass
+        return picks
 
-        return FrameContext(frame_idx=frame_idx, metrics_fn=metrics_fn,
-                            restoration_strength=self.cfg.restoration.max_strength)
+    def _process_with_retry(self, frame, picks, frame_idx, base_sharpen, max_retry, cv2):
+        """Render the frame's swaps, score flicker, and retry with reduced
+        restoration on FAIL (the dominant flicker source, PRD §41). Keeps the
+        lowest-flicker attempt; flags manual review past budget."""
+        from .quality_validator import verdict_from_metrics
 
-    def _record_frame(self, result, qfh, out_dir, frame_idx, swapped) -> None:
-        import cv2
+        best_frame, best_crops = self._render_attempt(frame, picks, base_sharpen, cv2)
+        best_metrics = self._measure_frame(picks, best_frame, best_crops, cv2)
+        verdict = verdict_from_metrics(best_metrics)
+        reasons: list[str] = []
+        retries = 0
+        while verdict == "FAIL" and retries < max_retry:
+            retries += 1
+            sharpen = base_sharpen * (0.5 ** retries)
+            f2, c2 = self._render_attempt(frame, picks, sharpen, cv2)
+            m2 = self._measure_frame(picks, f2, c2, cv2)
+            reasons.append("restoration_lower")
+            if m2["flicker_score"] < best_metrics["flicker_score"]:
+                best_frame, best_crops, best_metrics = f2, c2, m2
+            verdict = verdict_from_metrics(best_metrics)
+        if verdict == "FAIL":  # budget exhausted — keep best, downgrade, flag
+            verdict = "WARNING"
+            reasons.append("budget_exhausted")
+            self._dump_debug(frame, best_frame, frame_idx, cv2)
+        self._commit_prev(best_crops)
+        comps = {k: best_metrics.get(k, 0.0) for k in
+                 ("embedding", "color", "landmark", "mask", "sharpness")}
+        result = FrameResult(
+            frame_idx=frame_idx, verdict=verdict,
+            flicker_score=best_metrics["flicker_score"], components=comps,
+            retry_count=retries, retry_strategies=tuple(reasons), reasons=tuple(reasons),
+        )
+        return result, best_frame
 
+    def _render_attempt(self, frame, picks, sharpen, cv2):
+        """Run the natural colour-matched swap for every matched face."""
+        work = frame.copy()
+        crops: dict = {}
+        for face, si in picks:
+            res = self._swapper.swap(
+                work, face, self._source_faces[si],
+                natural=True, color_strength=self.cfg.restoration.max_strength,
+                sharpen=sharpen,
+            )
+            work = res.swapped_frame
+            x1, y1, x2, y2 = (int(v) for v in face.bbox)
+            x1, y1 = max(x1, 0), max(y1, 0)
+            crop = work[y1:y2, x1:x2]
+            if crop.size:
+                crops[si] = {
+                    "crop": cv2.resize(crop, (128, 128)),
+                    "kps": np.asarray(face.kps, np.float32),
+                    "diag": float(np.hypot(x2 - x1, y2 - y1)),
+                }
+        return work, crops
+
+    def _measure_frame(self, picks, out_frame, crops, cv2) -> dict:
+        """Per-frame Flicker Score (FR-9) = max over swapped sources of the
+        component score vs that source's previous swapped crop."""
+        from . import flicker
+
+        gray = cv2.cvtColor(out_frame, cv2.COLOR_BGR2GRAY)
+        frame_lap = float(cv2.Laplacian(gray, cv2.CV_64F).var()) or 1.0
+        weights = self.cfg.stabilization.flicker_weights
+        worst = 0.0
+        worst_comps = dict.fromkeys(flicker.COMPONENT_KEYS, 0.0)
+        for si, cur in crops.items():
+            prev = self._prev.get(si)
+            if prev is None:
+                continue
+            comps = flicker.compute_components(
+                face_a=prev["crop"], face_b=cur["crop"],
+                emb_a=None, emb_b=None,
+                lm_a=prev["kps"], lm_b=cur["kps"],
+                mask_a=None, mask_b=None,
+                bbox_diag=cur["diag"], frame_mean_lap=frame_lap,
+            )
+            fs = flicker.flicker_score(comps, weights)
+            if fs >= worst:
+                worst, worst_comps = fs, comps
+        return {**worst_comps, "flicker_score": worst,
+                "detection_confidence": 1.0, "landmark_confidence": 1.0,
+                "identity_consistency": 1.0, "mask_instability": worst_comps["mask"]}
+
+    def _commit_prev(self, crops) -> None:
+        for si, cur in crops.items():
+            self._prev[si] = cur
+
+    def _dump_debug(self, original, swapped, frame_idx, cv2) -> None:
+        """Manual-review bundle for a frame that exhausted retries (PRD §31)."""
+        try:
+            cv2.imwrite(str(self.dirs.debug / f"frame_{frame_idx:06d}_original.png"), original)
+            cv2.imwrite(str(self.dirs.debug / f"frame_{frame_idx:06d}_swapped.png"), swapped)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _record_frame(self, result, qfh, out_dir, frame_idx, swapped, cv2) -> None:
         qfh.write(json.dumps(result.to_json_obj()) + "\n")
         success = result.verdict in ("PASS", "WARNING")
         manual = "budget_exhausted" in result.reasons

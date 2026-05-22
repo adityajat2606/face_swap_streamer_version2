@@ -44,30 +44,64 @@ class Swapper:
             raise ModelLoadError("inswapper loaded on CPU only — CUDA failed (issue #8)")
 
     def swap(
-        self, frame_bgr: np.ndarray, target_face, source_face, *, paste_back: bool = True
+        self,
+        frame_bgr: np.ndarray,
+        target_face,
+        source_face,
+        *,
+        natural: bool = True,
+        color_strength: float = 0.6,
+        sharpen: float = 0.4,
     ) -> SwapResult:
         """Swap ``source_face`` identity onto ``target_face`` in ``frame_bgr``.
 
-        ``target_face``/``source_face`` are native insightface Face objects (the
-        detector's raw outputs), as in the v0 pipeline.
+        ``target_face``/``source_face`` are native insightface Face objects.
+        ``natural=True`` colour-matches the swapped crop to the target's own
+        lighting/skin tone and pastes it through a feathered mask (PRD §22/§23,
+        the proven webapp recipe) so it doesn't look like a pasted cut-out.
+        Falls back to inswapper's stock fused paste if ``natural`` is off or the
+        feathered mask is empty.
         """
         if self._swapper is None:
             raise ModelLoadError("Swapper.load() not called")
-        try:
-            swapped = self._swapper.get(
-                frame_bgr, target_face, source_face, paste_back=paste_back
-            )
-        except Exception as exc:  # narrow at call-site; surface as typed error
-            raise SwapInferenceError(f"inswapper failed: {exc}") from exc
-
         bbox = target_face.bbox
         face_bbox = BBox(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]),
                          float(getattr(target_face, "det_score", 1.0)))
-        mask = self._derive_mask(frame_bgr.shape[:2], face_bbox)
         lm = getattr(target_face, "kps", None)
         landmarks = Landmarks(np.asarray(lm, np.float32), 1.0) if lm is not None else None
+
+        try:
+            if natural:
+                from insightface.utils import face_align
+
+                from . import blend
+
+                bgr_fake, M = self._swapper.get(
+                    frame_bgr, target_face, source_face, paste_back=False
+                )
+                swap_size = int(self._swapper.input_size[0])
+                aligned, _ = face_align.norm_crop2(frame_bgr, target_face.kps, swap_size)
+                merged, mask = blend.paste_natural(
+                    frame_bgr, aligned, bgr_fake, M,
+                    color=True, color_strength=color_strength, sharpen=sharpen,
+                )
+                if mask is None:
+                    merged = self._swapper.get(
+                        frame_bgr, target_face, source_face, paste_back=True
+                    )
+                    mask = self._derive_mask(frame_bgr.shape[:2], face_bbox)
+                else:
+                    mask = mask[:, :, 0]
+            else:
+                merged = self._swapper.get(
+                    frame_bgr, target_face, source_face, paste_back=True
+                )
+                mask = self._derive_mask(frame_bgr.shape[:2], face_bbox)
+        except Exception as exc:  # narrow at call-site; surface as typed error
+            raise SwapInferenceError(f"inswapper failed: {exc}") from exc
+
         return SwapResult(
-            frame_idx=-1, swapped_frame=swapped, mask=mask, face_bbox=face_bbox,
+            frame_idx=-1, swapped_frame=merged, mask=mask, face_bbox=face_bbox,
             landmarks=landmarks,
         )
 
