@@ -1,0 +1,96 @@
+{
+  "tag": "v0-baseline",
+  "commit": "unknown",
+  "captured_at": "2026-05-22T09:20:05Z",
+  "test_sets": {
+    "slow_romantic": {
+      "clips": [
+        {
+          "path": "tests/fixtures/clips/slow_01.mp4",
+          "metrics": {
+            "face_detection_success_rate": null,
+            "frame_failure_rate": null,
+            "flicker_score_median": null,
+            "flicker_score_p95": null,
+            "identity_cosine_distance_mean": null,
+            "gpu_util_avg": null,
+            "wall_clock_s": null,
+            "human_rubric_mean": null
+          }
+        }
+      ]
+    },
+    "medium": {
+      "clips": [
+        {
+          "path": "tests/fixtures/clips/medium_01.mp4",
+          "metrics": {
+            "face_detection_success_rate": null,
+            "frame_failure_rate": null,
+            "flicker_score_median": null,
+            "flicker_score_p95": null,
+            "identity_cosine_distance_mean": null,
+            "gpu_util_avg": null,
+            "wall_clock_s": null,
+            "human_rubric_mean": null
+          }
+        }
+      ]
+    },
+    "fast_dance": {
+      "clips": [
+        {
+          "path": "tests/fixtures/clips/fast_01.mp4",
+          "metrics": {
+            "face_detection_success_rate": null,
+            "frame_failure_rate": null,
+            "flicker_score_median": null,
+            "flicker_score_p95": null,
+            "identity_cosine_distance_mean": null,
+            "gpu_util_avg": null,
+            "wall_clock_s": null,
+            "human_rubric_mean": null
+          }
+        }
+      ]
+    },
+    "profile": {
+      "clips": [
+        {
+          "path": "tests/fixtures/clips/profile_01.mp4",
+          "metrics": {
+            "face_detection_success_rate": null,
+            "frame_failure_rate": null,
+            "flicker_score_median": null,
+            "flicker_score_p95": null,
+            "identity_cosine_distance_mean": null,
+            "gpu_util_avg": null,
+            "wall_clock_s": null,
+            "human_rubric_mean": null
+          }
+        }
+      ]
+    },
+    "challenging": {
+      "clips": [
+        {
+          "path": "tests/fixtures/clips/challenging_01.mp4",
+          "metrics": {
+            "face_detection_success_rate": null,
+            "frame_failure_rate": null,
+            "flicker_score_median": null,
+            "flicker_score_p95": null,
+            "identity_cosine_distance_mean": null,
+            "gpu_util_avg": null,
+            "wall_clock_s": null,
+            "human_rubric_mean": null
+          }
+        }
+      ]
+    }
+  },
+  "flat_kpis": {
+    "flicker_score_median": null,
+    "flicker_score_p95": null
+  }
+}

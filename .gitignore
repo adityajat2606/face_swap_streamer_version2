@@ -1,0 +1,94 @@
+# --- Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# --- IDE / OS / agents
+.vscode/
+.idea/
+.claude/
+.playwright-mcp/
+.DS_Store
+Thumbs.db
+
+# --- Debug / scratch artefacts dropped at the repo root
+live-frame.png
+page-*.png
+debug-*.png
+*.commit-msg.tmp
+.commit-msg.tmp
+
+# --- Cloned upstream repos (provisioned by setup.ps1)
+facefusion/
+deep-live-cam/
+
+# --- Model files (too big; downloaded by setup.ps1)
+*.onnx
+*.pth
+*.pt
+*.bin
+*.safetensors
+.insightface/
+
+# --- Privacy: never commit personal source faces, copyrighted target videos,
+#     or derivative outputs to a public repo.
+source/
+songs/
+out/
+webapp_jobs/
+server/jobs/
+server/static/dist/
+Raw_videos/
+Swap_videos/
+Avatar_images/
+
+# --- Next.js / Node build outputs
+web/node_modules/
+web/.next/
+web/out/
+web/next-env.d.ts
+*.tsbuildinfo
+
+# --- Playwright debug screenshots dropped at the repo root
+new-upload-page.png
+latest_swapped_frame.png
+latest_swapped_frame.jpg
+
+# --- Logs
+*.log
+
+# --- Test artefacts
+_t.onnx
+_cuda_test.onnx
+
+# --- C++ CLI build artifacts + provisioned deps (downloaded by cli/scripts/setup.ps1)
+cli/build/
+cli/third_party/
+cli/models/
+cli/out_test/
+cli/out_batch/
+
+# --- Build artifacts (installer zip + staging tree)
+dist/
+
+# --- Cinematic Face Swap Stabilization Engine (src/face_swap)
+#     Local data + per-run artifacts; never commit (engine §4.1, §18.11).
+input/
+output/
+logs/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+uv.lock.local
+# baseline metrics JSON is committed; baseline clips are not:
+baseline/v0_clips/
+tests/fixtures/clips/
+
+# --- Misc
+*.tmp
+*.bak

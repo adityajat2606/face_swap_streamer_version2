@@ -1,0 +1,45 @@
+# Full-processing preset (CLAUDE.md §12.3).
+project:
+  name: quality
+  mode: quality
+processing:
+  max_retry_per_frame: 5
+  checkpoint_every_n_frames: 100
+  frame_storage_backend: ffv1
+  random_seed: 42
+face_detection:
+  det_size: [1280, 1280]
+  min_confidence: 0.70
+tracking:
+  enable_identity_tracks: true
+  enable_landmark_smoothing: true
+  enable_optical_flow_guidance: true
+  embedding_match_threshold: 0.40
+swap:
+  model: auto
+  preserve_expression: true
+  preserve_pose: true
+restoration:
+  enabled: true
+  strength: adaptive
+  avoid_plastic_skin: true
+  max_strength: 0.7
+stabilization:
+  enabled: true
+  temporal_window_frames: 5
+  flicker_detection: true
+  reprocess_unstable_frames: true
+  one_euro_landmarks: {min_cutoff: 1.0, beta: 0.007}
+  one_euro_bbox: {min_cutoff: 1.0, beta: 0.02}
+  flicker_weights: [0.30, 0.20, 0.20, 0.15, 0.15]
+output:
+  format: mp4
+  codec: h264
+  crf: 18
+  preset: medium
+  preserve_audio: true
+  generate_side_by_side_preview: true
+  generate_quality_report: true
+telemetry:
+  enabled: true
+  gpu_telemetry: true

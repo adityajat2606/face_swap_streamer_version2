@@ -1,0 +1,49 @@
+# Maximum-quality preset (CLAUDE.md §10.1, §12.3).
+# Do NOT set restoration.strength: high here (§18.7).
+project:
+  name: final_cinematic
+  mode: final_cinematic
+processing:
+  max_retry_per_frame: 8
+  checkpoint_every_n_frames: 100
+  frame_storage_backend: ffv1
+  random_seed: 42
+face_detection:
+  det_size: [1280, 1280]
+  min_confidence: 0.70
+tracking:
+  enable_identity_tracks: true
+  enable_landmark_smoothing: true
+  enable_optical_flow_guidance: true   # RAFT optical flow guidance (§8.2)
+  embedding_match_threshold: 0.40
+swap:
+  model: auto
+  preserve_expression: true
+  preserve_pose: true
+restoration:
+  enabled: true
+  strength: adaptive                   # never "high" (§18.7)
+  avoid_plastic_skin: true
+  max_strength: 0.7
+  max_strength_delta_per_frame: 0.05
+stabilization:
+  enabled: true
+  temporal_window_frames: 7
+  flicker_detection: true
+  reprocess_unstable_frames: true
+  one_euro_landmarks: {min_cutoff: 1.0, beta: 0.007}
+  one_euro_bbox: {min_cutoff: 1.0, beta: 0.02}
+  # Locked weights after §15.4 calibration (calibration commit: TBD).
+  flicker_weights: [0.30, 0.20, 0.20, 0.15, 0.15]
+output:
+  format: mp4
+  codec: h264
+  crf: 16
+  preset: slow
+  preserve_audio: true
+  generate_side_by_side_preview: true
+  generate_quality_report: true
+telemetry:
+  enabled: true
+  gpu_telemetry: true
+  health_check_enabled: true

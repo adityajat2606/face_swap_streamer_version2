@@ -1,0 +1,52 @@
+# Test-set manifest (CLAUDE.md §5.3). One entry per PRD §36 test set.
+# Clips are NOT committed (gitignored); paths are placeholders the product
+# owner fills in with consented, licensed footage. `internal_only` marks clips
+# not licensed for redistribution.
+#
+# Until real clips exist, this documents the five required sets so
+# `measure_baseline` emits a complete schema (§5.6 gate).
+
+test_set_1_slow_romantic:
+  - path: tests/fixtures/clips/slow_01.mp4
+    duration_s: 22
+    fps: 24
+    resolution: [1920, 1080]
+    notes: "Two-shot, low motion, soft lighting, both faces frontal."
+    license: internal_only
+    consent_record: docs/consent/slow_01.txt
+
+test_set_2_medium:
+  - path: tests/fixtures/clips/medium_01.mp4
+    duration_s: 18
+    fps: 24
+    resolution: [1920, 1080]
+    notes: "Moderate motion, occasional head turn."
+    license: internal_only
+    consent_record: docs/consent/medium_01.txt
+
+test_set_3_fast_dance:
+  - path: tests/fixtures/clips/fast_01.mp4
+    duration_s: 15
+    fps: 24
+    resolution: [1920, 1080]
+    notes: "Fast cuts, rapid motion, motion blur, subjects cross."
+    license: internal_only
+    consent_record: docs/consent/fast_01.txt
+
+test_set_4_profile:
+  - path: tests/fixtures/clips/profile_01.mp4
+    duration_s: 20
+    fps: 24
+    resolution: [1920, 1080]
+    notes: "Extended profile / off-axis poses, partial occlusion."
+    license: internal_only
+    consent_record: docs/consent/profile_01.txt
+
+test_set_5_challenging:
+  - path: tests/fixtures/clips/challenging_01.mp4
+    duration_s: 25
+    fps: 24
+    resolution: [1920, 1080]
+    notes: "Low light, heavy occlusion, >2 faces."
+    license: internal_only
+    consent_record: docs/consent/challenging_01.txt

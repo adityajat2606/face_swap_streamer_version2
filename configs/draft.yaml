@@ -1,0 +1,33 @@
+# Fast, lower-quality preset (CLAUDE.md §12.3).
+project:
+  name: draft
+  mode: draft
+processing:
+  max_retry_per_frame: 2
+  checkpoint_every_n_frames: 100
+  frame_storage_backend: ffv1
+  random_seed: 42
+face_detection:
+  det_size: [960, 960]
+  min_confidence: 0.70
+tracking:
+  enable_optical_flow_guidance: false
+swap:
+  model: auto
+restoration:
+  enabled: true
+  strength: low
+  max_strength: 0.5
+stabilization:
+  enabled: true
+  flicker_detection: true
+output:
+  format: mp4
+  codec: h264
+  crf: 22
+  preset: medium
+  preserve_audio: true
+  generate_side_by_side_preview: false
+telemetry:
+  enabled: true
+  gpu_telemetry: true
