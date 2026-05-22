@@ -322,6 +322,117 @@ def _match_faces_to_sources(sims, tgt_faces, thresh):
     return picks
 
 
+def _bbox_iou(a, b):
+    """IoU of two [x1,y1,x2,y2] boxes."""
+    ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+    iw = max(ix2 - ix1, 0.0); ih = max(iy2 - iy1, 0.0)
+    inter = iw * ih
+    aa = max(a[2] - a[0], 0.0) * max(a[3] - a[1], 0.0)
+    bb = max(b[2] - b[0], 0.0) * max(b[3] - b[1], 0.0)
+    u = aa + bb - inter
+    return float(inter / u) if u > 0 else 0.0
+
+
+class _SourceTracker:
+    """Per-source temporal tracking so a swap stays stable across frames.
+
+    Stateless per-face matching makes the swap blink on/off as the face turns
+    (its embedding similarity dips below threshold for a frame or two) or when
+    the detector misses a frame. This adds short-term memory:
+
+      * hysteresis  — once a source is locked onto a face, a much lower
+        ('sticky') threshold keeps it locked through borderline angle frames;
+      * spatial carry-through — if the embedding match drops but a detected
+        face still overlaps the source's last position, swap it anyway (the
+        face is there, just at a hard angle where the embedding is noisy);
+      * the source stays "warm" for a few frames after a true dropout so it
+        re-acquires instantly instead of cold-starting.
+
+    Sequential-frame use only (webapp.py). Tunables: FACESWAP_STICKY_FACTOR,
+    FACESWAP_CARRY_FRAMES, FACESWAP_TRACK_IOU.
+    """
+
+    def __init__(self, n_sources: int, ref_thresh: float):
+        self.S = n_sources
+        self.ref_thresh = ref_thresh
+        self.sticky = max(ref_thresh * float(os.getenv("FACESWAP_STICKY_FACTOR", "0.5")), 0.05)
+        self.carry_frames = int(os.getenv("FACESWAP_CARRY_FRAMES", "5"))
+        self.iou_gate = float(os.getenv("FACESWAP_TRACK_IOU", "0.3"))
+        self.last_bbox: list = [None] * n_sources
+        self.misses: list = [10 ** 9] * n_sources
+
+    def _warm(self, si: int) -> bool:
+        return self.misses[si] <= self.carry_frames and self.last_bbox[si] is not None
+
+    def match(self, sims, tgt_faces):
+        """Return [(face, source_index)] with hysteresis + carry-through, and
+        update temporal state. Same call shape as _match_faces_to_sources."""
+        T, S = sims.shape
+        bb = [np.asarray(f.bbox, dtype=np.float32) for f in tgt_faces]
+        face_taken = [False] * T
+        src_used = [False] * S
+        picks = []
+        primary = {}                      # si -> bbox from the 1-to-1 / carry match
+        force = (T == S)                  # duet: every source must be applied
+
+        def acceptable(ti, si):
+            if force:
+                return True
+            s = float(sims[ti, si])
+            if s >= self.ref_thresh:
+                return True
+            # locked + still in roughly the same place + not collapsed -> keep it
+            if self._warm(si) and s >= self.sticky \
+                    and _bbox_iou(bb[ti], self.last_bbox[si]) >= self.iou_gate:
+                return True
+            return False
+
+        # phase 1: greedy one-to-one by descending similarity, with hysteresis
+        order = np.dstack(
+            np.unravel_index(np.argsort(sims, axis=None)[::-1], sims.shape)
+        )[0]
+        for pair in order:
+            ti, si = int(pair[0]), int(pair[1])
+            if face_taken[ti] or src_used[si] or not acceptable(ti, si):
+                continue
+            picks.append((tgt_faces[ti], si))
+            face_taken[ti] = True; src_used[si] = True; primary[si] = bb[ti]
+            if all(src_used) or all(face_taken):
+                break
+
+        # phase 2: spatial carry-through for a warm source the embedding lost
+        for si in range(S):
+            if src_used[si] or not self._warm(si):
+                continue
+            best_ti, best_iou = -1, self.iou_gate
+            for ti in range(T):
+                if face_taken[ti]:
+                    continue
+                iou = _bbox_iou(bb[ti], self.last_bbox[si])
+                if iou >= best_iou:
+                    best_iou, best_ti = iou, ti
+            if best_ti >= 0:
+                picks.append((tgt_faces[best_ti], si))
+                face_taken[best_ti] = True; src_used[si] = True; primary[si] = bb[best_ti]
+
+        # phase 3: extra faces (repeated identity / crowd) -> best source
+        for ti in range(T):
+            if face_taken[ti]:
+                continue
+            si = int(np.argmax(sims[ti]))
+            if float(sims[ti, si]) >= self.ref_thresh:
+                picks.append((tgt_faces[ti], si)); face_taken[ti] = True
+
+        # update temporal state from the primary (one-to-one / carry) matches
+        for si in range(S):
+            if si in primary:
+                self.last_bbox[si] = primary[si]; self.misses[si] = 0
+            else:
+                self.misses[si] += 1
+        return picks
+
+
 def _run_job(job: Job):
     ffmpeg = None
     try:
@@ -579,6 +690,10 @@ def _run_job(job: Job):
         def _detect_loop():
             """Detect faces + embedding-match against the source pool. Emits
             (frame, list_of_(face, source_index)) tuples to the swap stage."""
+            # Temporal tracker: keeps each source locked onto its face across
+            # frames (hysteresis + spatial carry-through) so the swap doesn't
+            # blink on/off as the face turns. Frames are processed in order here.
+            tracker = _SourceTracker(len(ref_sources), REFERENCE_THRESH)
             try:
                 while True:
                     item = read_q.get()
@@ -599,7 +714,7 @@ def _run_job(job: Job):
                                     sims[:, s] = all_sims[:, cols].max(axis=1)
                         else:
                             sims = tgt_embs @ ref_embs.T              # fallback: centroid sim
-                        picks = _match_faces_to_sources(sims, tgt_faces, REFERENCE_THRESH)
+                        picks = tracker.match(sims, tgt_faces)
                     detect_q.put((frame, picks))
             finally:
                 detect_q.put(END)
