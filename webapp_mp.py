@@ -457,17 +457,39 @@ def _run_job(job: Job):
             c["m_frac"] = ms / tot
             c["f_frac"] = fs / tot
 
-        # Pick top-K clusters by size — the K most-recurring identities in the
-        # video. K = number of sources. This filters out small/spurious clusters
-        # (random extras) that would otherwise produce garbage ref_emb.
+        # Gender-aware cluster selection. Picking the top-K clusters purely by
+        # size silently drops the actress's cluster whenever the video has >=K
+        # male-dominant clusters (lead + male extras / crowd). Her source then
+        # gets bound to a male reference and every female face falls below
+        # REFERENCE_THRESH and is skipped. Fix: first reserve the largest
+        # cluster(s) of each gender the sources actually need, then fill any
+        # remaining slots by size. Degrades to size-only when a needed gender
+        # simply isn't present in the video.
+        from collections import Counter
         K = len(job.sources)
-        top_k = clusters[:K]
-        if len(top_k) < K:
-            # Not enough distinct identities — repeat the largest so every source
-            # at least gets a real ref_emb (job won't crash on small clips).
+        need = Counter(s.gender for s in job.sources)
+        used_ci: set = set()
+        sel: list = []
+        for g, cnt in need.items():
+            taken = 0
+            for ci, c in enumerate(clusters):
+                if ci in used_ci:
+                    continue
+                if c["gender"] == g:
+                    used_ci.add(ci); sel.append(ci); taken += 1
+                    if taken >= cnt:
+                        break
+        for ci in range(len(clusters)):          # fill remaining slots by size
+            if len(sel) >= K:
+                break
+            if ci not in used_ci:
+                used_ci.add(ci); sel.append(ci)
+        top_k = [clusters[ci] for ci in sel]
+        if len(top_k) < K and clusters:          # tiny clip: pad with the largest
             top_k = (top_k + [clusters[0]] * K)[:K]
         print(f"[webapp] reference clusters: total={len(clusters)} "
-              f"using top-{K} (sizes={[c['size'] for c in top_k]} "
+              f"using {K} (sizes={[c['size'] for c in top_k]} "
+              f"genders={[c['gender'] for c in top_k]} "
               f"m_frac={[round(c['m_frac'],2) for c in top_k]})",
               flush=True)
 
