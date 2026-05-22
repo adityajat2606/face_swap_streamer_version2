@@ -457,64 +457,50 @@ def _run_job(job: Job):
             c["m_frac"] = ms / tot
             c["f_frac"] = fs / tot
 
-        # Gender-aware cluster selection. Picking the top-K clusters purely by
-        # size silently drops the actress's cluster whenever the video has >=K
-        # male-dominant clusters (lead + male extras / crowd). Her source then
-        # gets bound to a male reference and every female face falls below
-        # REFERENCE_THRESH and is skipped. Fix: first reserve the largest
-        # cluster(s) of each gender the sources actually need, then fill any
-        # remaining slots by size. Degrades to size-only when a needed gender
-        # simply isn't present in the video.
-        from collections import Counter
-        K = len(job.sources)
-        need = Counter(s.gender for s in job.sources)
-        used_ci: set = set()
-        sel: list = []
-        for g, cnt in need.items():
-            taken = 0
-            for ci, c in enumerate(clusters):
-                if ci in used_ci:
-                    continue
-                if c["gender"] == g:
-                    used_ci.add(ci); sel.append(ci); taken += 1
-                    if taken >= cnt:
-                        break
-        for ci in range(len(clusters)):          # fill remaining slots by size
-            if len(sel) >= K:
-                break
-            if ci not in used_ci:
-                used_ci.add(ci); sel.append(ci)
-        top_k = [clusters[ci] for ci in sel]
-        if len(top_k) < K and clusters:          # tiny clip: pad with the largest
-            top_k = (top_k + [clusters[0]] * K)[:K]
-        print(f"[webapp] reference clusters: total={len(clusters)} "
-              f"using {K} (sizes={[c['size'] for c in top_k]} "
-              f"genders={[c['gender'] for c in top_k]} "
-              f"m_frac={[round(c['m_frac'],2) for c in top_k]})",
-              flush=True)
-
-        # Assignment by globally maximising gender-compatibility WEIGHTED by
-        # cluster size. For each permutation P of cluster indices, score is
-        #   sum_i  (m_frac if sources[i].gender=='M' else f_frac)[P[i]] * size[P[i]]
-        # The cluster-size weight dominates over majority-label noise: the
-        # actor's big cluster pulls the M-source toward it even if the
-        # actress's cluster has a slightly-M-leaning majority.
+        # ---- Gender-aware source -> cluster assignment ------------------------
+        # The lead actress is mislabeled 'M' on a sizeable fraction of frames
+        # (profile / lighting), so a cluster's HARD majority-vote gender label is
+        # unreliable, AND her identity cluster is often smaller than a male lead
+        # plus male extras. Selecting clusters by size alone (clusters[:K]) drops
+        # her cluster; selecting by the hard label misses it when the vote tips
+        # 'M'. Either way the female source binds to a male reference and every
+        # female face then falls below REFERENCE_THRESH and is SKIPPED.
+        #
+        # Robust fix: pick K DISTINCT clusters and assign each source to one so as
+        # to maximise sum( source_gender_fraction(cluster)**2 * cluster_size ),
+        # searched over an EXPANDED candidate pool (not just top-K by size) using
+        # the SOFT m_frac/f_frac (never the noisy hard label). Squaring the
+        # fraction makes gender fit dominate, so the female source lands on the
+        # most-female identity even when it is smaller and partially mislabeled;
+        # the size factor still prevents binding to tiny spurious clusters.
         from itertools import permutations
+        K = len(job.sources)
         sources_list = list(job.sources)
+        pool_n = min(len(clusters), max(2 * K, 8))   # surface minority identities
+        pool = clusters[:pool_n]
+
+        def _fit(si: int, c: dict) -> float:
+            frac = c["m_frac"] if sources_list[si].gender == "M" else c["f_frac"]
+            return frac * frac * c["size"]
+
         best_score = -1.0
-        best_perm = tuple(range(K))
-        for perm in permutations(range(K)):
-            score = 0.0
-            for si, ci in enumerate(perm):
-                cluster = top_k[ci]
-                frac = cluster["m_frac"] if sources_list[si].gender == "M" else cluster["f_frac"]
-                score += frac * cluster["size"]
-            if score > best_score:
-                best_score = score
-                best_perm = perm
-        print(f"[webapp] cluster assignment: "
-              f"{[(sources_list[si].gender, top_k[ci]['size']) for si, ci in enumerate(best_perm)]} "
-              f"score={best_score:.2f}", flush=True)
+        best_assign: tuple = tuple(range(min(K, len(pool))))
+        if pool:
+            for perm in permutations(range(len(pool)), min(K, len(pool))):
+                score = sum(_fit(si, pool[ci]) for si, ci in enumerate(perm))
+                if score > best_score:
+                    best_score = score
+                    best_assign = perm
+        top_k = [pool[ci] for ci in best_assign]
+        if len(top_k) < K:
+            pad = top_k[0] if top_k else (clusters[0] if clusters else None)
+            top_k = (top_k + [pad] * K)[:K] if pad is not None else top_k
+        best_perm = tuple(range(K))   # top_k is already in source order
+        print(f"[webapp] cluster assignment (pool={len(pool)}/{len(clusters)}): "
+              + ", ".join(
+                  f"src{si}({sources_list[si].gender})->size{top_k[si]['size']}"
+                  f"/f_frac{round(top_k[si]['f_frac'],2)}" for si in range(K))
+              + f" score={best_score:.2f}", flush=True)
 
         for si, ci in enumerate(best_perm):
             cluster = top_k[ci]
