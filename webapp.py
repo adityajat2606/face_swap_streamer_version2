@@ -46,6 +46,7 @@ import cv2
 import numpy as np
 import insightface
 from insightface.app import FaceAnalysis
+from insightface.utils import face_align
 from flask import Flask, request, jsonify, Response, redirect, url_for, send_from_directory
 
 
@@ -320,6 +321,83 @@ def _match_faces_to_sources(sims, tgt_faces, thresh):
         if float(sims[ti, si]) >= thresh:
             picks.append((tgt_faces[ti], si))
     return picks
+
+
+# --- Natural-blend paste: colour-match the swapped face to the target's own
+#     lighting/skin tone + feather the edge, so the swap doesn't look like a
+#     differently-coloured cut-out pasted on the neck. Ported from the MP worker
+#     so the stable single-process path looks just as natural. Toggle/tune with
+#     FACESWAP_ENHANCE / FACESWAP_COLOR_MATCH / FACESWAP_COLOR_STRENGTH /
+#     FACESWAP_SHARPEN.
+_ENHANCE_CFG = {
+    "enhance": os.getenv("FACESWAP_ENHANCE", "1") not in ("0", "false", "False"),
+    "color": os.getenv("FACESWAP_COLOR_MATCH", "1") not in ("0", "false", "False"),
+    "color_strength": float(os.getenv("FACESWAP_COLOR_STRENGTH", "0.6")),
+    "sharpen": float(os.getenv("FACESWAP_SHARPEN", "0.4")),
+}
+
+
+def _color_transfer(src, ref, strength):
+    """Match `src`'s colour stats to `ref` in LAB (Reinhard). Both BGR uint8,
+    same HxW. `strength` blends back toward the raw swap so we fix lighting
+    without washing out identity."""
+    s = cv2.cvtColor(src, cv2.COLOR_BGR2LAB).astype(np.float32)
+    r = cv2.cvtColor(ref, cv2.COLOR_BGR2LAB).astype(np.float32)
+    out = s.copy()
+    for i in range(3):
+        smean, sstd = s[..., i].mean(), s[..., i].std() + 1e-6
+        rmean, rstd = r[..., i].mean(), r[..., i].std() + 1e-6
+        out[..., i] = (s[..., i] - smean) * (rstd / sstd) + rmean
+    matched = cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+    if strength >= 0.999:
+        return matched
+    return cv2.addWeighted(matched, strength, src, 1.0 - strength, 0.0)
+
+
+def _unsharp(img, amount, radius=1.0):
+    if amount <= 0:
+        return img
+    blur = cv2.GaussianBlur(img, (0, 0), radius)
+    return cv2.addWeighted(img, 1.0 + amount, blur, -amount, 0.0)
+
+
+def _feathered_face_mask(M, src_h, src_w, dst_h, dst_w):
+    """Soft paste mask: white aligned crop warped back to the frame, eroded
+    inward and Gaussian-feathered (inswapper's own recipe). Returns
+    ((dst_h,dst_w,1) float32 [0,1], inverse-affine) or (None, IM)."""
+    IM = cv2.invertAffineTransform(M)
+    white = np.full((src_h, src_w), 255.0, dtype=np.float32)
+    mask = cv2.warpAffine(white, IM, (dst_w, dst_h), borderValue=0.0)
+    mask[mask > 20] = 255
+    ys, xs = np.where(mask == 255)
+    if len(ys) == 0:
+        return None, IM
+    msize = int(np.sqrt((ys.max() - ys.min()) * (xs.max() - xs.min())))
+    k = max(msize // 10, 10)
+    mask = cv2.erode(mask, np.ones((k, k), np.uint8), iterations=1)
+    k = max(msize // 20, 5)
+    blur = tuple(2 * i + 1 for i in (k, k))
+    mask = cv2.GaussianBlur(mask, blur, 0) / 255.0
+    return mask[:, :, None], IM
+
+
+def _swap_natural(sw, frame, tface, src_face, swap_size):
+    """Swap + colour-match + feathered paste. Falls back to the stock inswapper
+    fused paste if enhancement is disabled or the mask is empty."""
+    if not _ENHANCE_CFG["enhance"]:
+        return sw.get(frame, tface, src_face, paste_back=True)
+    bgr_fake, M = sw.get(frame, tface, src_face, paste_back=False)
+    aimg, _ = face_align.norm_crop2(frame, tface.kps, swap_size)
+    if _ENHANCE_CFG["color"]:
+        bgr_fake = _color_transfer(bgr_fake, aimg, _ENHANCE_CFG["color_strength"])
+    bgr_fake = _unsharp(bgr_fake, _ENHANCE_CFG["sharpen"])
+    h, w = frame.shape[:2]
+    mask, IM = _feathered_face_mask(M, aimg.shape[0], aimg.shape[1], h, w)
+    if mask is None:
+        return sw.get(frame, tface, src_face, paste_back=True)
+    warped = cv2.warpAffine(bgr_fake, IM, (w, h), borderValue=0.0)
+    merged = mask * warped + (1.0 - mask) * frame.astype(np.float32)
+    return merged.astype(np.uint8)
 
 
 def _bbox_iou(a, b):
@@ -760,8 +838,9 @@ def _run_job(job: Job):
                 frame, picks = item
                 n += 1
                 for tface, si in picks:
-                    frame = sw.get(frame, tface, ref_sources[si].src_face,
-                                   paste_back=True)
+                    frame = _swap_natural(sw, frame, tface,
+                                          ref_sources[si].src_face,
+                                          int(sw.input_size[0]))
                     swap_count += 1
 
                 if broken:
