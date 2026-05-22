@@ -133,15 +133,17 @@ def _ensure_models():
     with _models_lock:
         if _face_analyser is None:
             face_model = os.getenv("FACESWAP_FACE_MODEL", "buffalo_l")
-            # det_size 640 is the model's native — preserves more detail for
-            # small/far faces. Detection costs a bit more than 480 but the
-            # quality win is worth it. det_thresh 0.3 is more permissive than
-            # the InsightFace default 0.5; needed to catch profile shots,
-            # tiny dance-floor faces, and motion-blurred frames. False-positive
-            # detections are filtered by the reference-embedding match later
-            # so the looser threshold is safe for our pipeline.
-            det_size = int(os.getenv("FACESWAP_DET_SIZE", "640"))
-            det_thresh = float(os.getenv("FACESWAP_DET_THRESH", "0.3"))
+            # det_size 800 (up from 640) detects more small / far / profile
+            # faces — the single biggest lever for "a face was never swapped
+            # because it was never detected" (e.g. the actress in wide/dance
+            # shots). Cost: detection is ~1.5x slower than 640. For max coverage
+            # set FACESWAP_DET_SIZE=1280; for max speed set 640.
+            # det_thresh 0.25 (down from 0.3) raises recall on profile / blurred
+            # / tiny faces. The InsightFace default is 0.5; false-positive
+            # detections are filtered by the reference-embedding match later, so
+            # the looser threshold is safe for our pipeline.
+            det_size = int(os.getenv("FACESWAP_DET_SIZE", "800"))
+            det_thresh = float(os.getenv("FACESWAP_DET_THRESH", "0.25"))
             print(f"[webapp] loading face analyser (CUDA, model={face_model}, "
                   f"det_size={det_size}, det_thresh={det_thresh})...", flush=True)
             fa = FaceAnalysis(name=face_model,
@@ -375,12 +377,17 @@ def _run_job(job: Job):
         genders_needed = set(s.gender for s in job.sources)
         _set(job, phase="finding_reference",
              message=f"Scanning video for {' + '.join(sorted(genders_needed))} face{'s' if len(genders_needed) > 1 else ''} to swap onto…")
-        step = max(1, int(fps * 2.0))
+        # Denser reference scan: sample every 1s (was 2s) and keep up to 300
+        # candidates (was 120). More samples per identity => stronger, more
+        # complete clusters => the secondary lead (often the actress) reliably
+        # forms her own cluster instead of being under-sampled and dropped.
+        # Tune via FACESWAP_REF_SAMPLE_SEC / FACESWAP_REF_MAX_SAMPLES.
+        step = max(1, int(fps * float(os.getenv("FACESWAP_REF_SAMPLE_SEC", "1.0"))))
         min_ref_face_w = int(os.getenv("FACESWAP_MIN_REF_FACE_W", "25"))
         # all_candidates: list of (score, embedding, frame_idx, per_frame_genderage_label)
         all_candidates: list = []
         i = 0
-        max_samples = 120
+        max_samples = int(os.getenv("FACESWAP_REF_MAX_SAMPLES", "300"))
         while i < total and len(all_candidates) < max_samples:
             if job.stop_flag.is_set():
                 raise RuntimeError("cancelled")

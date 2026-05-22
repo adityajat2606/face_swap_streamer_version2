@@ -205,8 +205,8 @@ def _ensure_models():
             # tiny dance-floor faces, and motion-blurred frames. False-positive
             # detections are filtered by the reference-embedding match later
             # so the looser threshold is safe for our pipeline.
-            det_size = int(os.getenv("FACESWAP_DET_SIZE", "640"))
-            det_thresh = float(os.getenv("FACESWAP_DET_THRESH", "0.3"))
+            det_size = int(os.getenv("FACESWAP_DET_SIZE", "800"))
+            det_thresh = float(os.getenv("FACESWAP_DET_THRESH", "0.25"))
             print(f"[webapp] loading face analyser (CUDA, model={face_model}, "
                   f"det_size={det_size}, det_thresh={det_thresh})...", flush=True)
             fa = FaceAnalysis(name=face_model, providers=providers,
@@ -392,11 +392,14 @@ def _run_job(job: Job):
         genders_needed = set(s.gender for s in job.sources)
         _set(job, phase="finding_reference",
              message=f"Scanning video for {' + '.join(sorted(genders_needed))} face{'s' if len(genders_needed) > 1 else ''} to swap onto…")
-        step = max(1, int(fps * 2.0))
+        # Denser reference scan (every 1s, up to 300 candidates — was 2s/120)
+        # so the secondary lead reliably forms her own cluster. Tune via
+        # FACESWAP_REF_SAMPLE_SEC / FACESWAP_REF_MAX_SAMPLES.
+        step = max(1, int(fps * float(os.getenv("FACESWAP_REF_SAMPLE_SEC", "1.0"))))
         min_ref_face_w = int(os.getenv("FACESWAP_MIN_REF_FACE_W", "25"))
         all_candidates: list = []
         i = 0
-        max_samples = 120
+        max_samples = int(os.getenv("FACESWAP_REF_MAX_SAMPLES", "300"))
         while i < total and len(all_candidates) < max_samples:
             if job.stop_flag.is_set():
                 raise RuntimeError("cancelled")
@@ -620,8 +623,8 @@ def _run_job(job: Job):
             in_q  = mp.Queue(maxsize=n_slots)        # SwapRequest (single shared)
             out_q = mp.Queue()                       # SwapResponse (single shared)
 
-            det_size   = int(os.getenv("FACESWAP_DET_SIZE", "640"))
-            det_thresh = float(os.getenv("FACESWAP_DET_THRESH", "0.3"))
+            det_size   = int(os.getenv("FACESWAP_DET_SIZE", "800"))
+            det_thresh = float(os.getenv("FACESWAP_DET_THRESH", "0.25"))
             face_model = os.getenv("FACESWAP_FACE_MODEL", "buffalo_l")
 
             warm_t0 = time.perf_counter()
