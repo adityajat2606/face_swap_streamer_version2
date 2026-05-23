@@ -149,9 +149,12 @@ def run(cfg: Config, output: Path, *, baseline_path: Path | None = None) -> Exit
     _register_health_checks(obs, cfg)
     bind_run_context(run_id=run_id, stage="init")
 
-    # persist the resolved config for resume verification (§14.2).
+    # persist the resolved config for resume verification (§14.2) and the
+    # per-PRD §32/§48 separate model_versions.json.
     (dirs.config / "run_config.yaml").write_text(_dump_config(cfg), encoding="utf-8")
     manifest = build_manifest_skeleton(cfg, run_id, dirs)
+    (dirs.config / "model_versions.json").write_text(
+        json.dumps(manifest["model_versions"], indent=2), encoding="utf-8")
     write_manifest(dirs.root, manifest)
 
     _log.info("run_started", run_id=run_id, mode=cfg.project.mode,
@@ -235,11 +238,48 @@ def resume(run_dir: Path) -> ExitCode:
 
 
 def resolve_identity_mapping(run_id: str) -> None:  # pragma: no cover - interactive
-    """Interactive identity confirmation entry point (§7.4)."""
-    raise NotImplementedError(
-        "interactive identity resolution runs on the GPU host; "
-        "see docs and output/<run_id>/identity_map.yaml"
-    )
+    """Interactive identity confirmation (PRD §FR-4 / §7.4).
+
+    Reads the run's ``identity_map.yaml``, prints the auto-assignment to the
+    operator, and lets them keep, swap (when there are two sources), or abort.
+    The confirmed mapping is written back with ``confirmed: true``.
+    """
+    import click
+    import yaml
+
+    candidates = [Path("output") / run_id, Path(run_id), Path("./output") / run_id]
+    run_dir = next((p for p in candidates if p.is_dir()), None)
+    if run_dir is None:
+        raise InputError(f"run directory for {run_id!r} not found")
+    map_path = run_dir / "identity_map.yaml"
+    if not map_path.is_file():
+        raise InputError(f"no identity_map.yaml in {run_dir}")
+    data = yaml.safe_load(map_path.read_text(encoding="utf-8")) or {}
+    mapping = data.get("identity_map") or {}
+    click.echo(f"Auto-assigned identity mapping in {run_dir.name}:")
+    for si, ident in mapping.items():
+        click.echo(f"  source {si} -> {ident}")
+    debug = run_dir / "debug_frames"
+    if debug.is_dir():
+        samples = sorted(debug.glob("frame_*_swapped.png"))[:3]
+        if samples:
+            click.echo("Reference frames for review:")
+            for p in samples:
+                click.echo(f"  {p}")
+    if click.confirm("Keep this mapping?", default=True):
+        data["confirmed"] = True
+        map_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        click.echo("Mapping confirmed.")
+        return
+    if len(mapping) == 2 and click.confirm("Swap the two sources?", default=True):
+        keys = list(mapping.keys())
+        mapping[keys[0]], mapping[keys[1]] = mapping[keys[1]], mapping[keys[0]]
+        data["identity_map"] = mapping
+        data["confirmed"] = True
+        map_path.write_text(yaml.safe_dump(data), encoding="utf-8")
+        click.echo("Mapping swapped and saved.")
+        return
+    click.echo("Aborted; mapping unchanged.")
 
 
 def _exit_code_from_kpis(kpis: dict, had_manual_review: bool) -> ExitCode:

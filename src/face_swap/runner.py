@@ -90,14 +90,18 @@ class StageRunner:
             self._last_bbox_per_src: dict = {}
 
     def _detect_source_face(self, path: str):
-        """Largest insightface Face in a reference photo — the identity to paste."""
+        """Largest insightface Face in a reference photo — the identity to paste.
+        Reference is preprocessed (grey-world WB + CLAHE on L) so AI-generated
+        or oddly-lit photos don't poison the embedding (PRD §20)."""
         import cv2
 
         from .errors import InputError
+        from .reference_preproc import preprocess_reference
 
         img = cv2.imread(path)
         if img is None:
             raise InputError(f"cannot read reference image: {path}")
+        img = preprocess_reference(img)
         faces = self._detector.app.get(img)
         if not faces:
             raise InputError(f"no face in reference image: {path}")
@@ -597,6 +601,15 @@ class StageRunner:
                     renderer.reattach_audio(no_audio, Path(str(self.cfg.input.video_path)), final)
                 else:
                     no_audio.replace(final)
+                # Side-by-side preview (PRD §32) — original | swapped.
+                if self.cfg.output.generate_side_by_side_preview:
+                    try:
+                        renderer.side_by_side_preview(
+                            Path(str(self.cfg.input.video_path)), final,
+                            self.dirs.root / "preview_side_by_side.mp4",
+                        )
+                    except Exception as exc:  # noqa: BLE001 - preview is optional
+                        _log.warning("preview_failed", error=str(exc))
             except Exception as exc:  # noqa: BLE001
                 _log.error("render_failed", error=str(exc))
                 raise
