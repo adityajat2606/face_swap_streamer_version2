@@ -62,6 +62,7 @@ class StageRunner:
     # ---- model loading + identity routing -----------------------------
     def _load_models(self) -> None:
         from .face_detector import Detector
+        from .restoration_engine import Restorer
         from .swap_engine import Swapper
 
         with self.obs.span("load_models"):
@@ -72,6 +73,21 @@ class StageRunner:
             self._detector.load()
             self._swapper = Swapper()
             self._swapper.load()
+            self._restorer = None
+            if self.cfg.restoration.enabled:
+                try:
+                    r = Restorer(max_strength=self.cfg.restoration.max_strength)
+                    r.load()
+                    self._restorer = r
+                    _log.info("restoration_loaded")
+                except Exception as exc:  # noqa: BLE001 - restoration is optional
+                    _log.warning("restoration_unavailable", error=str(exc))
+            # Per-source previous restoration strength for rate-limiting (§FR-7).
+            self._prev_strength: dict = {}
+            # Per-source previous swapped-face embedding for Flicker emb-delta (§FR-9).
+            self._prev_emb: dict = {}
+            # Per-source last bbox for the detector ROI fallback (§FR-3).
+            self._last_bbox_per_src: dict = {}
 
     def _detect_source_face(self, path: str):
         """Largest insightface Face in a reference photo — the identity to paste."""
@@ -187,12 +203,15 @@ class StageRunner:
             bind_run_context(frame_idx=frame_idx, stage="frame")
             t0 = time.perf_counter()
             with self.obs.span("frame", frame_idx=frame_idx):
-                dets = self._detector.app.get(frame)
+                dets = self._detect_with_fallback(frame)
                 picks = []
                 if dets:
                     sims, bboxes = self._build_sims(dets)
                     picks = [(dets[fi], si) for fi, si in self._matcher.match(sims, bboxes)]
                     picks = self._smooth_picks(picks, frame_idx, meta.fps)
+                    # remember last bbox per source for next-frame ROI fallback
+                    for face, si in picks:
+                        self._last_bbox_per_src[si] = np.asarray(face.bbox, np.float32)
                 result, out_frame = self._process_with_retry(
                     frame, picks, frame_idx, base_sharpen, max_retry, cv2)
 
@@ -201,6 +220,49 @@ class StageRunner:
             self._record_frame(result, qfh, out_dir, frame_idx, out_frame, cv2)
             if (frame_idx + 1) % ckpt_every == 0:
                 self._checkpoint(frame_idx)
+
+    def _detect_with_fallback(self, frame):
+        """Detector fallback ladder (PRD §FR-3): primary -> higher det_size ->
+        ROI search around each source's last known bbox. Returns raw insightface
+        Face objects (kps/embedding preserved) so the downstream swap path is
+        unaffected."""
+        app = self._detector.app
+        faces = app.get(frame)
+        if faces:
+            return faces
+        # ladder step 2: re-run at a larger det_size
+        orig_size = app.det_model.input_size
+        try:
+            app.det_model.input_size = (1920, 1920)
+            faces = app.get(frame)
+        except Exception:  # noqa: BLE001 - fallback is best-effort
+            faces = []
+        finally:
+            app.det_model.input_size = orig_size
+        if faces:
+            _log.info("detect_fallback_hires")
+            return faces
+        # ladder step 3: search dilated ROI around each source's last bbox
+        h, w = frame.shape[:2]
+        collected = []
+        for bbox in self._last_bbox_per_src.values():
+            if bbox is None:
+                continue
+            bw, bh = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            x1 = max(int(bbox[0] - bw * 0.5), 0)
+            y1 = max(int(bbox[1] - bh * 0.5), 0)
+            x2 = min(int(bbox[2] + bw * 0.5), w)
+            y2 = min(int(bbox[3] + bh * 0.5), h)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = frame[y1:y2, x1:x2]
+            for f in app.get(crop):
+                f.bbox = f.bbox + np.array([x1, y1, x1, y1], np.float32)
+                f.kps = f.kps + np.array([x1, y1], np.float32)
+                collected.append(f)
+        if collected:
+            _log.info("detect_fallback_roi", count=len(collected))
+        return collected
 
     def _smooth_picks(self, picks, frame_idx, fps):
         """One-Euro smooth each matched face's landmarks before the swap (FR-8)
@@ -241,7 +303,9 @@ class StageRunner:
         if verdict == "FAIL":  # budget exhausted — keep best, downgrade, flag
             verdict = "WARNING"
             reasons.append("budget_exhausted")
-            self._dump_debug(frame, best_frame, frame_idx, cv2)
+            self._dump_debug(frame, best_frame, frame_idx, cv2,
+                             picks=picks, crops=best_crops, metrics=best_metrics,
+                             reasons=reasons)
         self._commit_prev(best_crops)
         comps = {k: best_metrics.get(k, 0.0) for k in
                  ("embedding", "color", "landmark", "mask", "sharpness")}
@@ -253,16 +317,27 @@ class StageRunner:
         return result, best_frame
 
     def _render_attempt(self, frame, picks, sharpen, cv2):
-        """Run the natural colour-matched swap for every matched face."""
+        """Run the natural colour-matched swap (+ optional GFPGAN restoration) for
+        every matched face. Restoration strength is adaptive (scaled by scene
+        sharpness) and rate-limited per source so the strength schedule itself
+        doesn't flicker (PRD §FR-7, §41)."""
+        from .restoration_engine import adaptive_strength, rate_limit_strength
+
         work = frame.copy()
         crops: dict = {}
+        max_rs = self.cfg.restoration.max_strength
+        delta = self.cfg.restoration.max_strength_delta_per_frame
+        scene_strength = adaptive_strength(frame, base=max_rs, max_strength=max_rs)
         for face, si in picks:
+            prev_s = self._prev_strength.get(si, scene_strength)
+            rs = rate_limit_strength(prev_s, scene_strength, max_delta=delta)
             res = self._swapper.swap(
                 work, face, self._source_faces[si],
-                natural=True, color_strength=self.cfg.restoration.max_strength,
-                sharpen=sharpen,
+                natural=True, color_strength=max_rs, sharpen=sharpen,
+                restorer=self._restorer, restoration_strength=rs,
             )
             work = res.swapped_frame
+            self._prev_strength[si] = rs
             x1, y1, x2, y2 = (int(v) for v in face.bbox)
             x1, y1 = max(x1, 0), max(y1, 0)
             crop = work[y1:y2, x1:x2]
@@ -271,8 +346,27 @@ class StageRunner:
                     "crop": cv2.resize(crop, (128, 128)),
                     "kps": np.asarray(face.kps, np.float32),
                     "diag": float(np.hypot(x2 - x1, y2 - y1)),
+                    "bbox": (x1, y1, x2, y2),
+                    "emb": self._embed_swapped(work, face),
                 }
         return work, crops
+
+    def _embed_swapped(self, swapped_frame, target_face):
+        """Re-embed the swapped face for the Flicker embedding term (PRD §FR-9).
+        Uses insightface's recognition model on the aligned 112-crop. Returns
+        ``None`` if unavailable (the embedding component then contributes 0)."""
+        rec = getattr(self._detector.app, "models", {}).get("recognition")
+        if rec is None or not hasattr(target_face, "kps"):
+            return None
+        try:
+            from insightface.utils import face_align
+
+            aimg, _ = face_align.norm_crop2(swapped_frame, target_face.kps, 112)
+            emb = rec.get_feat(aimg).flatten().astype(np.float32)
+            n = float(np.linalg.norm(emb))
+            return emb / n if n > 0 else None
+        except Exception:  # noqa: BLE001 - embedding term is optional
+            return None
 
     def _measure_frame(self, picks, out_frame, crops, cv2) -> dict:
         """Per-frame Flicker Score (FR-9) = max over swapped sources of the
@@ -290,7 +384,7 @@ class StageRunner:
                 continue
             comps = flicker.compute_components(
                 face_a=prev["crop"], face_b=cur["crop"],
-                emb_a=None, emb_b=None,
+                emb_a=prev.get("emb"), emb_b=cur.get("emb"),
                 lm_a=prev["kps"], lm_b=cur["kps"],
                 mask_a=None, mask_b=None,
                 bbox_diag=cur["diag"], frame_mean_lap=frame_lap,
@@ -306,13 +400,38 @@ class StageRunner:
         for si, cur in crops.items():
             self._prev[si] = cur
 
-    def _dump_debug(self, original, swapped, frame_idx, cv2) -> None:
-        """Manual-review bundle for a frame that exhausted retries (PRD §31)."""
+    def _dump_debug(self, original, swapped, frame_idx, cv2, *,
+                    picks=None, crops=None, metrics=None, reasons=None) -> None:
+        """Manual-review bundle for a frame that exhausted retries (PRD §31):
+        original, swapped, landmarks overlay, mask viz, and a reasons.json."""
+        stem = self.dirs.debug / f"frame_{frame_idx:06d}"
         try:
-            cv2.imwrite(str(self.dirs.debug / f"frame_{frame_idx:06d}_original.png"), original)
-            cv2.imwrite(str(self.dirs.debug / f"frame_{frame_idx:06d}_swapped.png"), swapped)
-        except Exception:  # noqa: BLE001
-            pass
+            cv2.imwrite(str(stem) + "_original.png", original)
+            cv2.imwrite(str(stem) + "_swapped.png", swapped)
+            if picks:
+                overlay = original.copy()
+                for face, _si in picks:
+                    x1, y1, x2, y2 = (int(v) for v in face.bbox)
+                    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    for pt in np.asarray(face.kps, np.int32):
+                        cv2.circle(overlay, (int(pt[0]), int(pt[1])), 2, (0, 0, 255), -1)
+                cv2.imwrite(str(stem) + "_landmarks.png", overlay)
+            if crops:
+                h, w = swapped.shape[:2]
+                viz = np.zeros((h, w), np.uint8)
+                for c in crops.values():
+                    x1, y1, x2, y2 = c.get("bbox", (0, 0, 0, 0))
+                    cv2.rectangle(viz, (x1, y1), (x2, y2), 255, -1)
+                cv2.imwrite(str(stem) + "_mask.png", viz)
+            reasons_obj = {
+                "frame": frame_idx,
+                "reasons": list(reasons or ()),
+                "metrics": metrics or {},
+            }
+            (stem.parent / f"frame_{frame_idx:06d}_reasons.json").write_text(
+                json.dumps(reasons_obj, indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("debug_dump_failed", frame_idx=frame_idx, error=str(exc))
 
     def _record_frame(self, result, qfh, out_dir, frame_idx, swapped, cv2) -> None:
         qfh.write(json.dumps(result.to_json_obj()) + "\n")

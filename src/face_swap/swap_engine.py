@@ -52,15 +52,17 @@ class Swapper:
         natural: bool = True,
         color_strength: float = 0.6,
         sharpen: float = 0.4,
+        restorer: Any = None,
+        restoration_strength: float = 0.0,
     ) -> SwapResult:
         """Swap ``source_face`` identity onto ``target_face`` in ``frame_bgr``.
 
-        ``target_face``/``source_face`` are native insightface Face objects.
         ``natural=True`` colour-matches the swapped crop to the target's own
-        lighting/skin tone and pastes it through a feathered mask (PRD §22/§23,
-        the proven webapp recipe) so it doesn't look like a pasted cut-out.
-        Falls back to inswapper's stock fused paste if ``natural`` is off or the
-        feathered mask is empty.
+        lighting/skin tone and pastes it through a feathered mask (PRD §22/§23).
+        If a ``restorer`` is supplied with ``restoration_strength > 0`` it is
+        applied to the inswapper's raw 128px output and then sharpness-matched to
+        the surrounding frame (PRD §FR-7, §41, Risk 4) so the restored face
+        doesn't end up sharper than the rest of the video.
         """
         if self._swapper is None:
             raise ModelLoadError("Swapper.load() not called")
@@ -75,12 +77,19 @@ class Swapper:
                 from insightface.utils import face_align
 
                 from . import blend
+                from .restoration_engine import match_sharpness
 
                 bgr_fake, M = self._swapper.get(
                     frame_bgr, target_face, source_face, paste_back=False
                 )
                 swap_size = int(self._swapper.input_size[0])
                 aligned, _ = face_align.norm_crop2(frame_bgr, target_face.kps, swap_size)
+                if restorer is not None and restoration_strength > 0:
+                    try:
+                        bgr_fake = restorer.restore(bgr_fake, restoration_strength)
+                        bgr_fake = match_sharpness(bgr_fake, aligned)
+                    except Exception as exc:  # noqa: BLE001 - restoration is optional
+                        _log.warning("restoration_skipped", error=str(exc))
                 merged, mask = blend.paste_natural(
                     frame_bgr, aligned, bgr_fake, M,
                     color=True, color_strength=color_strength, sharpen=sharpen,
@@ -97,6 +106,8 @@ class Swapper:
                     frame_bgr, target_face, source_face, paste_back=True
                 )
                 mask = self._derive_mask(frame_bgr.shape[:2], face_bbox)
+        except SwapInferenceError:
+            raise
         except Exception as exc:  # narrow at call-site; surface as typed error
             raise SwapInferenceError(f"inswapper failed: {exc}") from exc
 
