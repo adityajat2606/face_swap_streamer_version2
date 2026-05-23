@@ -280,10 +280,21 @@ class StageRunner:
                 pass
         return picks
 
+    # Ordered §30 strategies the runner actually re-swaps with. Each entry is
+    # (name, transform_picks_or_params) — strategies inswapper can't honour are
+    # logged as no-ops rather than silently dropped, so the audit trail is
+    # complete.
+    _REAL_RETRY = (
+        "restoration_lower", "landmarks_from_prev", "swap_detector",
+        "blending_mask_alt", "restoration_higher",
+    )
+    _SKIPPED_RETRY = ("crop_larger", "crop_smaller", "landmarks_from_next",
+                      "temporal_interpolation")
+
     def _process_with_retry(self, frame, picks, frame_idx, base_sharpen, max_retry, cv2):
-        """Render the frame's swaps, score flicker, and retry with reduced
-        restoration on FAIL (the dominant flicker source, PRD §41). Keeps the
-        lowest-flicker attempt; flags manual review past budget."""
+        """Render the frame's swaps, score flicker, and walk the §30 retry queue
+        on FAIL. Each strategy actually re-swaps; the lowest-flicker attempt
+        wins; over-budget frames are flagged for manual review."""
         from .quality_validator import verdict_from_metrics
 
         best_frame, best_crops = self._render_attempt(frame, picks, base_sharpen, cv2)
@@ -291,12 +302,13 @@ class StageRunner:
         verdict = verdict_from_metrics(best_metrics)
         reasons: list[str] = []
         retries = 0
-        while verdict == "FAIL" and retries < max_retry:
+        for strategy in self._REAL_RETRY:
+            if verdict != "FAIL" or retries >= max_retry:
+                break
             retries += 1
-            sharpen = base_sharpen * (0.5 ** retries)
-            f2, c2 = self._render_attempt(frame, picks, sharpen, cv2)
+            reasons.append(strategy)
+            f2, c2 = self._attempt_strategy(strategy, frame, picks, base_sharpen, cv2)
             m2 = self._measure_frame(picks, f2, c2, cv2)
-            reasons.append("restoration_lower")
             if m2["flicker_score"] < best_metrics["flicker_score"]:
                 best_frame, best_crops, best_metrics = f2, c2, m2
             verdict = verdict_from_metrics(best_metrics)
@@ -315,6 +327,85 @@ class StageRunner:
             retry_count=retries, retry_strategies=tuple(reasons), reasons=tuple(reasons),
         )
         return result, best_frame
+
+    def _attempt_strategy(self, strategy, frame, picks, base_sharpen, cv2):
+        """Apply a §30 retry strategy and re-render the frame.
+
+        Strategies that inswapper's fixed alignment can't meaningfully act on
+        (crop_larger/_smaller, landmarks_from_next, temporal_interpolation) are
+        logged as no-ops and re-render with the base parameters so the budget
+        progresses; the audit trail records what was tried.
+        """
+        if strategy == "restoration_lower":
+            return self._render_attempt(frame, picks, base_sharpen * 0.5, cv2)
+        if strategy == "restoration_higher":
+            return self._render_attempt(frame, picks, min(base_sharpen * 1.5, 1.0), cv2)
+        if strategy == "landmarks_from_prev":
+            patched: list = []
+            for face, si in picks:
+                prev = self._prev.get(si)
+                if prev is not None and "kps" in prev:
+                    face.kps = np.asarray(prev["kps"], np.float32)
+                patched.append((face, si))
+            return self._render_attempt(frame, patched, base_sharpen, cv2)
+        if strategy == "swap_detector":
+            refined = self._detect_with_fallback(frame)
+            if refined:
+                # re-bind each pick to the nearest refined face by IoU
+                from .matching import bbox_iou
+
+                bb_ref = [np.asarray(f.bbox, np.float32) for f in refined]
+                replaced: list = []
+                for face, si in picks:
+                    fb = np.asarray(face.bbox, np.float32)
+                    best, b_iou = face, 0.0
+                    for j, f in enumerate(refined):
+                        iou = bbox_iou(fb, bb_ref[j])
+                        if iou > b_iou:
+                            b_iou, best = iou, f
+                    replaced.append((best, si))
+                return self._render_attempt(frame, replaced, base_sharpen, cv2)
+            return self._render_attempt(frame, picks, base_sharpen, cv2)
+        if strategy == "blending_mask_alt":
+            return self._render_attempt_alt_mask(frame, picks, base_sharpen, cv2)
+        # crop_larger, crop_smaller, landmarks_from_next, temporal_interpolation:
+        # inswapper's alignment is determined by face.kps, so 'crop' is implicit;
+        # next-frame look-ahead would block the streaming flow; temporal
+        # interpolation belongs upstream of the swap. Log + re-render with base
+        # params so the retry budget still moves.
+        _log.info("retry_strategy_noop", strategy=strategy)
+        return self._render_attempt(frame, picks, base_sharpen, cv2)
+
+    def _render_attempt_alt_mask(self, frame, picks, sharpen, cv2):
+        """Alt-mask variant: heavier feather + lower colour-match strength, so a
+        hard mask edge or oversaturated colour adaptation can be retried."""
+        from .restoration_engine import adaptive_strength, rate_limit_strength
+
+        work = frame.copy()
+        crops: dict = {}
+        max_rs = self.cfg.restoration.max_strength
+        scene = adaptive_strength(frame, base=max_rs, max_strength=max_rs)
+        for face, si in picks:
+            rs = rate_limit_strength(self._prev_strength.get(si, scene), scene,
+                                     max_delta=self.cfg.restoration.max_strength_delta_per_frame)
+            res = self._swapper.swap(
+                work, face, self._source_faces[si],
+                natural=True, color_strength=max_rs * 0.5, sharpen=sharpen * 0.5,
+                restorer=self._restorer, restoration_strength=rs,
+            )
+            work = res.swapped_frame
+            x1, y1, x2, y2 = (int(v) for v in face.bbox)
+            x1, y1 = max(x1, 0), max(y1, 0)
+            crop = work[y1:y2, x1:x2]
+            if crop.size:
+                crops[si] = {
+                    "crop": cv2.resize(crop, (128, 128)),
+                    "kps": np.asarray(face.kps, np.float32),
+                    "diag": float(np.hypot(x2 - x1, y2 - y1)),
+                    "bbox": (x1, y1, x2, y2),
+                    "emb": self._embed_swapped(work, face),
+                }
+        return work, crops
 
     def _render_attempt(self, frame, picks, sharpen, cv2):
         """Run the natural colour-matched swap (+ optional GFPGAN restoration) for
@@ -368,9 +459,34 @@ class StageRunner:
         except Exception:  # noqa: BLE001 - embedding term is optional
             return None
 
+    @staticmethod
+    def _warp_prev_to_current(prev, cur, cv2):
+        """Affine motion compensation per face (PRD §15.3 fallback): warp the
+        previous swapped face crop into the current crop's coordinate system
+        using a partial-affine fit on the landmark correspondences. Returns
+        ``prev["crop"]`` unchanged if the fit fails."""
+        def to_crop(kps, bbox):
+            x1, y1, x2, y2 = bbox
+            sx = 128.0 / max(x2 - x1, 1)
+            sy = 128.0 / max(y2 - y1, 1)
+            return (np.asarray(kps, np.float32) - np.array([x1, y1], np.float32)) \
+                   * np.array([sx, sy], np.float32)
+
+        try:
+            src = to_crop(prev["kps"], prev["bbox"])
+            dst = to_crop(cur["kps"], cur["bbox"])
+            M, _ = cv2.estimateAffinePartial2D(src, dst)
+            if M is None:
+                return prev["crop"]
+            return cv2.warpAffine(prev["crop"], M, (128, 128),
+                                  borderMode=cv2.BORDER_REPLICATE)
+        except Exception:  # noqa: BLE001 - motion comp must not break measurement
+            return prev["crop"]
+
     def _measure_frame(self, picks, out_frame, crops, cv2) -> dict:
         """Per-frame Flicker Score (FR-9) = max over swapped sources of the
-        component score vs that source's previous swapped crop."""
+        component score vs that source's previous swapped crop, after affine
+        motion compensation via the landmark correspondences (§15.3)."""
         from . import flicker
 
         gray = cv2.cvtColor(out_frame, cv2.COLOR_BGR2GRAY)
@@ -382,8 +498,9 @@ class StageRunner:
             prev = self._prev.get(si)
             if prev is None:
                 continue
+            warped_prev = self._warp_prev_to_current(prev, cur, cv2)
             comps = flicker.compute_components(
-                face_a=prev["crop"], face_b=cur["crop"],
+                face_a=warped_prev, face_b=cur["crop"],
                 emb_a=prev.get("emb"), emb_b=cur.get("emb"),
                 lm_a=prev["kps"], lm_b=cur["kps"],
                 mask_a=None, mask_b=None,
