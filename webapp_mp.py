@@ -626,6 +626,14 @@ def _run_job(job: Job):
             det_size   = int(os.getenv("FACESWAP_DET_SIZE", "800"))
             det_thresh = float(os.getenv("FACESWAP_DET_THRESH", "0.25"))
             face_model = os.getenv("FACESWAP_FACE_MODEL", "buffalo_l")
+            # Tier 2 crowd-mode (2026-05-24): "gender" swaps every detected face
+            # using a same-gender avatar (cycling); "identity" uses the legacy
+            # cluster + cosine-sim path that skips faces below REFERENCE_THRESH.
+            match_mode = os.getenv("FACESWAP_MATCH_MODE", "gender")
+            # NMS over detected faces — suppresses duplicate boxes for the same
+            # physical face that otherwise produced paste-bleed artefacts when
+            # two overlapping soft masks were composited.
+            nms_iou    = float(os.getenv("FACESWAP_NMS_IOU", "0.5"))
 
             warm_t0 = time.perf_counter()
             for wid in range(n_workers):
@@ -636,6 +644,7 @@ def _run_job(job: Job):
                         ref_embs_bytes, ref_sources_pickled, ref_members_pickled,
                         det_size, det_thresh, REFERENCE_THRESH,
                         face_model, SWAPPER_PATH,
+                        match_mode, nms_iou,
                     ),
                     name=f"swap-worker-{wid}",
                     daemon=False,   # keep alive across the job; we join() explicitly
@@ -2090,4 +2099,4 @@ if __name__ == "__main__":
     _port = int(os.environ.get("FACESWAP_PORT", "8080"))
     print(f"[webapp] starting on http://localhost:{_port}/  (jobs at " + JOBS_DIR + ")", flush=True)
     # Threaded server so the long-poll MJPEG stream doesn't block other requests.
-    app.run(host="0.0.0.0", port=_port, threaded=True, debug=False, use_reloader=False)
+    app.run(host="::", port=_port, threaded=True, debug=False, use_reloader=False)

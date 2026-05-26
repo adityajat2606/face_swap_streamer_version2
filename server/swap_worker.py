@@ -269,6 +269,71 @@ def _match_faces_to_sources(sims, thresh):
     return out
 
 
+def _match_faces_by_gender(tgt_faces, ref_sources):
+    """Gender-based one-to-many assignment: every detected face gets swapped using
+    a same-gender avatar. Cycles through same-gender sources when there are more
+    faces of that gender than avatars uploaded. Falls back to any available source
+    if no avatar of the detected gender exists.
+
+    Used when FACESWAP_MATCH_MODE=gender (the "swap everyone" crowd-mode requested
+    2026-05-24). No similarity threshold — every face is assigned to some source,
+    so crowds beyond the uploaded avatar count are still fully swapped.
+    """
+    pool_by_gender = {"M": [], "F": []}
+    for si, src in enumerate(ref_sources):
+        pool_by_gender.setdefault(src.get("gender") or "M", []).append(si)
+    counters = {"M": 0, "F": 0, "_": 0}
+    fallback = list(range(len(ref_sources)))
+    out = []
+    for ti, face in enumerate(tgt_faces):
+        g = getattr(face, "sex", None)
+        pool = pool_by_gender.get(g) if g else None
+        if not pool:
+            pool = fallback
+            key = "_"
+        else:
+            key = g
+        if not pool:
+            continue
+        si = pool[counters[key] % len(pool)]
+        counters[key] += 1
+        out.append((ti, si))
+    return out
+
+
+def _face_bbox_iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    if inter == 0.0:
+        return 0.0
+    a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    b_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    return inter / max(1e-9, (a_area + b_area - inter))
+
+
+def _suppress_overlapping_faces(faces, iou_thresh):
+    """Drop detections whose bbox overlaps a higher-confidence one above iou_thresh.
+
+    Prevents two near-duplicate detections of the same physical face from both
+    being swapped (which previously produced visible paste-bleed artefacts where
+    two soft masks overlapped). Conservative threshold (~0.5) keeps legitimately
+    adjacent people, suppresses only true duplicates.
+    """
+    if len(faces) <= 1 or iou_thresh >= 1.0:
+        return faces
+    ranked = sorted(faces,
+                    key=lambda f: float(getattr(f, "det_score", 0.0)),
+                    reverse=True)
+    kept = []
+    for f in ranked:
+        if all(_face_bbox_iou(f.bbox, k.bbox) <= iou_thresh for k in kept):
+            kept.append(f)
+    return kept
+
+
 def _color_transfer(src, ref, strength, np, cv2):
     """Match `src`'s colour statistics to `ref` in LAB (Reinhard transfer).
 
@@ -402,6 +467,68 @@ class FaceEnhancer:
         return merged.astype(np.uint8)
 
 
+class FaceEnhancerCodeFormer:
+    """CodeFormer ONNX face-restoration wrapper, run AFTER GFPGAN to recover the
+    fine details GFPGAN tends to over-smooth (eyes, lip texture, hair edges).
+
+    Same crop / paste-back recipe as FaceEnhancer. The model has TWO inputs —
+    `input` (the cropped face, 512×512 RGB normalised to [-1,1]) and `weight`
+    (scalar in [0,1] controlling the fidelity→quality dial; ~0.7 is balanced,
+    1.0 is max restoration but can lose identity, 0.0 is identity passthrough).
+    """
+
+    def __init__(self, model_path, providers, np, cv2):
+        import onnxruntime
+        cuda_opts = {
+            "arena_extend_strategy": "kSameAsRequested",
+            "cudnn_conv_algo_search": "HEURISTIC",
+            "cudnn_conv_use_max_workspace": "0",
+        }
+        gpu_mb = os.getenv("FACESWAP_CODEFORMER_GPU_MEM_MB", "").strip()
+        if gpu_mb:
+            cuda_opts["gpu_mem_limit"] = str(int(gpu_mb) * 1024 * 1024)
+        providers = [("CUDAExecutionProvider", cuda_opts), "CPUExecutionProvider"]
+        self.session = onnxruntime.InferenceSession(model_path, providers=providers)
+        names = [i.name for i in self.session.get_inputs()]
+        self.image_input = "input" if "input" in names else names[0]
+        self.weight_input = "weight" if "weight" in names else (
+            names[1] if len(names) > 1 else None)
+        self.output_name = self.session.get_outputs()[0].name
+        shp = self.session.get_inputs()[0].shape
+        self.size = int(shp[2]) if isinstance(shp[2], int) else 512
+        self.np = np
+        self.cv2 = cv2
+
+    def providers(self):
+        try:
+            return self.session.get_providers()
+        except Exception:
+            return None
+
+    def enhance(self, frame, kps, blend, weight):
+        from insightface.utils import face_align
+        np, cv2 = self.np, self.cv2
+        aimg, M = face_align.norm_crop2(frame, kps, self.size)
+        blob = aimg[:, :, ::-1].astype(np.float32) / 255.0
+        blob = (blob - 0.5) / 0.5
+        blob = np.ascontiguousarray(blob.transpose(2, 0, 1)[None])
+        feeds = {self.image_input: blob}
+        if self.weight_input is not None:
+            feeds[self.weight_input] = np.array([float(weight)], dtype=np.float64)
+        out = self.session.run([self.output_name], feeds)[0][0]
+        out = np.clip(out * 0.5 + 0.5, 0, 1).transpose(1, 2, 0)[:, :, ::-1]
+        restored = (out * 255.0).astype(np.uint8)
+        h, w = frame.shape[:2]
+        mask, IM = _feathered_face_mask(M, self.size, self.size, h, w, np, cv2)
+        if mask is None:
+            return frame
+        if blend < 0.999:
+            mask = mask * blend
+        warped = cv2.warpAffine(restored, IM, (w, h), borderValue=0.0)
+        merged = mask * warped + (1.0 - mask) * frame.astype(np.float32)
+        return merged.astype(np.uint8)
+
+
 def _load_enhancer_config(np, cv2, worker_id, providers):
     """Read FACESWAP_* enhancement env into a config dict, and load GFPGAN if
     enabled and the model file is present. Never raises — on any problem it
@@ -415,7 +542,7 @@ def _load_enhancer_config(np, cv2, worker_id, providers):
         "color": _flag("FACESWAP_COLOR_MATCH", "1"),
         "color_strength": float(os.getenv("FACESWAP_COLOR_STRENGTH", "0.6")),
         "sharpen": float(os.getenv("FACESWAP_SHARPEN", "0.4")),
-        "enhancer": None,                                    # FaceEnhancer or None
+        "enhancer": None,                                    # FaceEnhancer (GFPGAN) or None
         "enhancer_blend": float(os.getenv("FACESWAP_ENHANCER_BLEND", "0.8")),
         # GFPGAN is the costliest stage (512px restore + two full-frame warps per
         # face). Restoration only visibly helps faces that are large on screen;
@@ -423,6 +550,13 @@ def _load_enhancer_config(np, cv2, worker_id, providers):
         # the detected face's longest bbox side is below this many pixels (they
         # still get the near-free colour+sharpen paste). 0 = restore every face.
         "enhancer_min_face": float(os.getenv("FACESWAP_ENHANCER_MIN_FACE", "0")),
+        # Tier 3 (2026-05-24): CodeFormer chained AFTER GFPGAN — GFPGAN smooths
+        # skin, CodeFormer puts back the fine eye/lip/hair detail it smooths
+        # away. Reverse order would smooth out CodeFormer's detail.
+        "codeformer": None,                                  # FaceEnhancerCodeFormer or None
+        "codeformer_weight": float(os.getenv("FACESWAP_CODEFORMER_WEIGHT", "0.7")),
+        "codeformer_blend": float(os.getenv("FACESWAP_CODEFORMER_BLEND", "0.8")),
+        "codeformer_min_face": float(os.getenv("FACESWAP_CODEFORMER_MIN_FACE", "0")),
     }
     if not cfg["enhance"]:
         print(f"[worker-{worker_id}] enhancement disabled (FACESWAP_ENHANCE=0)", flush=True)
@@ -447,9 +581,29 @@ def _load_enhancer_config(np, cv2, worker_id, providers):
         else:
             print(f"[worker-{worker_id}] GFPGAN model not found at {model_path} — "
                   f"colour+sharpen only", flush=True)
+    if _flag("FACESWAP_CODEFORMER", "1"):
+        root = os.getenv("FACESWAP_ROOT") or os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))
+        cf_path = os.getenv("FACESWAP_CODEFORMER_MODEL",
+                            os.path.join(root, "models", "codeformer.onnx"))
+        if os.path.isfile(cf_path):
+            try:
+                cfg["codeformer"] = FaceEnhancerCodeFormer(cf_path, providers, np, cv2)
+                print(f"[worker-{worker_id}] CodeFormer loaded "
+                      f"({os.path.basename(cf_path)} @ {cfg['codeformer'].size}px, "
+                      f"weight={cfg['codeformer_weight']}, blend={cfg['codeformer_blend']}, "
+                      f"providers={cfg['codeformer'].providers()})", flush=True)
+            except Exception as e:
+                print(f"[worker-{worker_id}] CodeFormer load FAILED ({e}) — "
+                      f"continuing without it", flush=True)
+                cfg["codeformer"] = None
+        else:
+            print(f"[worker-{worker_id}] CodeFormer model not found at {cf_path} — "
+                  f"skipping (GFPGAN only)", flush=True)
     print(f"[worker-{worker_id}] enhance: color={cfg['color']} "
           f"strength={cfg['color_strength']} sharpen={cfg['sharpen']} "
           f"gfpgan={'on' if cfg['enhancer'] else 'off'} "
+          f"codeformer={'on' if cfg['codeformer'] else 'off'} "
           f"min_face={cfg['enhancer_min_face']:.0f}px", flush=True)
     return cfg
 
@@ -467,9 +621,11 @@ def worker_main(
     ref_members_pickled: bytes, # pickled list[numpy.ndarray (M_s, D)] — per-source cluster members
     det_size: int,              # face detector input (square)
     det_thresh: float,          # detector confidence threshold
-    ref_thresh: float,          # cosine-sim threshold for source-match
+    ref_thresh: float,          # cosine-sim threshold for source-match (identity mode only)
     models_face_dir: Optional[str],  # FACESWAP_FACE_MODEL or None
     inswapper_path: str,        # absolute path to inswapper_128_fp16.onnx
+    match_mode: str = "identity",   # "gender" -> swap-every-face by gender; "identity" -> legacy NN match
+    nms_iou: float = 0.5,           # IoU threshold for suppressing duplicate detections
 ) -> None:
     """Process entry. Loads models, then loops on `in_q` until END.
 
@@ -628,47 +784,76 @@ def worker_main(
                 # max-over-members is much more stable per-frame than
                 # centroid-only sim.
                 tgt_faces = fa.get(frame)
+                # Suppress duplicate detections of the same physical face. Two
+                # boxes for one face -> two overlapping paste-back masks -> visible
+                # bleed/halo on adjacent regions. NMS-style filter, conservative
+                # iou threshold so genuinely adjacent people are still both kept.
+                tgt_faces = _suppress_overlapping_faces(tgt_faces, nms_iou)
                 n_swapped = 0
                 if tgt_faces:
-                    tgt_embs = np.stack([f.normed_embedding for f in tgt_faces]).astype(np.float32)
-                    if stacked_T is not None and source_idx_map is not None:
-                        # (T, total_M) — sim of each target to every cluster member.
-                        all_sims = tgt_embs @ stacked_T
-                        S = len(ref_sources)
-                        # Per source: take max across that source's columns.
-                        sims = np.full((all_sims.shape[0], S), -1.0, dtype=np.float32)
-                        for s in range(S):
-                            cols = (source_idx_map == s)
-                            if cols.any():
-                                sims[:, s] = all_sims[:, cols].max(axis=1)
+                    if match_mode == "gender":
+                        # Swap-everyone-by-gender: every detected face gets an
+                        # avatar of matching gender (cycling if more faces than
+                        # same-gender avatars). No similarity threshold => crowds
+                        # are fully swapped.
+                        pairs = _match_faces_by_gender(tgt_faces, ref_sources)
                     else:
-                        sims = tgt_embs @ ref_embs_T      # fallback to centroid sim
-                    for ti, si in _match_faces_to_sources(sims, ref_thresh):
+                        tgt_embs = np.stack([f.normed_embedding for f in tgt_faces]).astype(np.float32)
+                        if stacked_T is not None and source_idx_map is not None:
+                            # (T, total_M) — sim of each target to every cluster member.
+                            all_sims = tgt_embs @ stacked_T
+                            S = len(ref_sources)
+                            # Per source: take max across that source's columns.
+                            sims = np.full((all_sims.shape[0], S), -1.0, dtype=np.float32)
+                            for s in range(S):
+                                cols = (source_idx_map == s)
+                                if cols.any():
+                                    sims[:, s] = all_sims[:, cols].max(axis=1)
+                        else:
+                            sims = tgt_embs @ ref_embs_T      # fallback to centroid sim
+                        pairs = _match_faces_to_sources(sims, ref_thresh)
+
+                    # Snapshot original pixels: every swap reads from `orig` so
+                    # an already-pasted face cannot bleed into the swap computed
+                    # for an adjacent face. Paste-back still accumulates onto
+                    # `frame`. Skipped when no pairs to swap to avoid wasted copy.
+                    orig = frame.copy() if pairs else frame
+
+                    for ti, si in pairs:
                         tface = tgt_faces[ti]
                         src_face = ref_sources[si]["src_face"]
                         if enh["enhance"]:
                             # Custom paste: get the raw 128px swap + affine
                             # matrix, colour-match it to the target lighting
                             # and sharpen, then paste back ourselves.
-                            bgr_fake, M = sw.get(frame, tface, src_face,
+                            bgr_fake, M = sw.get(orig, tface, src_face,
                                                  paste_back=False)
                             aimg, _ = face_align.norm_crop2(
-                                frame, tface.kps, swap_size)
+                                orig, tface.kps, swap_size)
                             frame[...] = _paste_enhanced(
                                 frame, aimg, bgr_fake, M, enh, np, cv2)
                             # GFPGAN restoration on the just-swapped face,
                             # but only when the face is large enough to
                             # benefit — skipping tiny faces is the main
                             # FPS lever in multi-face / crowd scenes.
-                            if enh["enhancer"] is not None:
-                                x1, y1, x2, y2 = tface.bbox
-                                face_px = max(x2 - x1, y2 - y1)
-                                if face_px >= enh["enhancer_min_face"]:
-                                    frame[...] = enh["enhancer"].enhance(
-                                        frame, tface.kps, enh["enhancer_blend"])
+                            x1, y1, x2, y2 = tface.bbox
+                            face_px = max(x2 - x1, y2 - y1)
+                            if enh["enhancer"] is not None and face_px >= enh["enhancer_min_face"]:
+                                frame[...] = enh["enhancer"].enhance(
+                                    frame, tface.kps, enh["enhancer_blend"])
+                            # Tier 3: CodeFormer restoration AFTER GFPGAN.
+                            # GFPGAN smooths skin -> CodeFormer puts detail back.
+                            # Reads `frame` (the just-restored buffer) by design.
+                            if enh["codeformer"] is not None and face_px >= enh["codeformer_min_face"]:
+                                frame[...] = enh["codeformer"].enhance(
+                                    frame, tface.kps,
+                                    enh["codeformer_blend"],
+                                    enh["codeformer_weight"])
                         else:
-                            # Stock inswapper fused swap+paste (byte-for-byte
-                            # identical to the Phase 2 path). FACESWAP_ENHANCE=0.
+                            # Stock inswapper fused swap+paste (FACESWAP_ENHANCE=0).
+                            # Reads from cumulative `frame` — multi-face bleed can
+                            # still occur on this path. Use FACESWAP_ENHANCE=1
+                            # (the Tier 1 default) for the clean orig-snapshot path.
                             frame[...] = sw.get(frame, tface, src_face,
                                                 paste_back=True)
                         n_swapped += 1
