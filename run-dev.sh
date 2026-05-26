@@ -23,36 +23,10 @@ PS="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 PORT="${FACESWAP_PORT:-8090}"
 LOG="$PROJ/out/dev-webapp.log"
 PIDFILE="$PROJ/out/dev-webapp.pid"
-STATS_PIDFILE="$PROJ/out/gpu-stats.pid"
-STATS_LOG="$PROJ/out/gpu-swap-stats.log"
-STATS_DAEMON="$PROJ/gpu-swap-stats-daemon.sh"
 
 port_in_use() { ss -tln 2>/dev/null | grep -q ":${PORT} "; }
 
-ensure_stats_daemon() {
-  [[ -x "$STATS_DAEMON" ]] || return 0
-  if [[ -f "$STATS_PIDFILE" ]] && kill -0 "$(cat "$STATS_PIDFILE")" 2>/dev/null; then
-    return 0
-  fi
-  nohup bash "$STATS_DAEMON" >/dev/null 2>&1 &
-  echo $! > "$STATS_PIDFILE"
-  echo "  gpu stats: tail -f $STATS_LOG   (daemon pid $(cat "$STATS_PIDFILE"))"
-}
-
-stop_stats_daemon() {
-  if [[ -f "$STATS_PIDFILE" ]]; then
-    local pid; pid="$(cat "$STATS_PIDFILE")"
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -TERM "$pid" 2>/dev/null || true
-      sleep 1
-      kill -KILL "$pid" 2>/dev/null || true
-    fi
-    rm -f "$STATS_PIDFILE"
-  fi
-}
-
 stop_server() {
-  stop_stats_daemon
   if [[ -f "$PIDFILE" ]]; then
     local pid; pid="$(cat "$PIDFILE")"
     if kill -0 "$pid" 2>/dev/null; then
@@ -93,7 +67,6 @@ esac
 if port_in_use; then
   echo "version2 dev server already running on port ${PORT}."
   print_links
-  ensure_stats_daemon
   exit 0
 fi
 
@@ -103,63 +76,28 @@ mkdir -p "$PROJ/out"
 # --- GPU / runtime env (mirrors the working production setup) -------------
 export FACESWAP_ROOT="$PROJ"
 export FACESWAP_PORT="$PORT"
-# Quality-optimized defaults (Tier 1): 4 workers + GFPGAN ON + 800px detection.
-# Each worker holds 3 ONNX sessions in VRAM: buffalo_l detector + inswapper +
-# GFPGAN restorer. At 4 workers that fits in 16 GB (~13-14 GiB peak). Pushing to
-# 6 workers WITH GFPGAN spills CUDA to system RAM over PCIe -> ~3 fps collapse.
-# If you need more throughput and can sacrifice the GFPGAN polish, set
-# FACESWAP_ENHANCER=0 and bump FACESWAP_WORKERS up to 6.
-export FACESWAP_WORKERS="${FACESWAP_WORKERS:-4}"
-# 800px detection (insightface code default) catches smaller/farther faces in
-# crowd scenes. 480 was the old throughput-tilt setting and missed people.
-export FACESWAP_DET_SIZE="${FACESWAP_DET_SIZE:-800}"
-# GFPGAN (512px restore) is the single biggest quality lever — sharpens skin,
-# eyes, hair after the inswapper paste. Required for "looks real" output.
-# Pair with FACESWAP_WORKERS<=4 (see comment above) or it will OOM-spill.
-export FACESWAP_ENHANCER="${FACESWAP_ENHANCER:-1}"
-# Tier 3 (2026-05-24): CodeFormer chained AFTER GFPGAN. GFPGAN smooths skin
-# (removes inswapper's 128px paste artefacts) but over-smooths fine detail;
-# CodeFormer puts back eye/lip/hair detail on top. Weight 0.7 is the
-# "looks-like-the-source" sweet spot — push to 0.85 for max restoration at the
-# cost of some identity drift; drop to 0.5 if it looks "too cleaned-up".
-# VRAM: adds ~0.6 GB/worker; 4 workers × all four ONNX sessions ≈ 14 GiB peak
-# on the 16 GB 5080. If you see NVENC rc=171 errors, drop FACESWAP_WORKERS=3.
-#
-# 2026-05-25: DISABLED. Post-mortem of the 6682-frame crowd job showed VRAM
-# peaked at 15,839 / 16,384 MiB (96.7%) — CUDA arena spilled to host RAM over
-# PCIe, GPU sat in P8 idle 77% of samples, throughput collapsed to 0.10 fps.
-# Dropping CodeFormer (keeping GFPGAN) brings the peak to ~13.4 GiB, comfortably
-# off the ceiling. Re-enable with FACESWAP_CODEFORMER=1 only after pairing it
-# with FACESWAP_WORKERS=3.
-export FACESWAP_CODEFORMER="${FACESWAP_CODEFORMER:-0}"
-export FACESWAP_CODEFORMER_WEIGHT="${FACESWAP_CODEFORMER_WEIGHT:-0.7}"
-export FACESWAP_CODEFORMER_BLEND="${FACESWAP_CODEFORMER_BLEND:-0.8}"
+# GFPGAN restoration adds a 3rd ONNX session per worker on the single 16GB
+# RTX 5080. At 6 workers (buffalo_l + inswapper + GFPGAN ×6) VRAM hit ~96% and
+# CUDA spilled to system RAM over PCIe -> throughput collapsed to ~3 fps. With
+# 3 workers every session stays resident in VRAM and runs at full speed.
+# 6 workers only fits with GFPGAN OFF. Each worker = buffalo_l + inswapper
+# (+ GFPGAN if enabled). 6×(those three) overruns the 16GB card (~15.7GB ->
+# spill over PCIe -> ~3fps, the original regression). With GFPGAN disabled
+# below, 6×(buffalo_l + inswapper) fits comfortably and runs fast.
+export FACESWAP_WORKERS="${FACESWAP_WORKERS:-6}"
+export FACESWAP_DET_SIZE="${FACESWAP_DET_SIZE:-480}"
+# GFPGAN (512px restore) is the VRAM hog that makes 6 workers spill. Off here so
+# 6 workers fit + run fast. The colour-match + unsharp paste (FACESWAP_ENHANCE,
+# default on) still improves every face. To get GFPGAN back, set
+# FACESWAP_ENHANCER=1 AND drop FACESWAP_WORKERS to <=4.
+export FACESWAP_ENHANCER="${FACESWAP_ENHANCER:-0}"
 # Only run GFPGAN on faces whose longest side is >= this many px (when enabled).
-# 180 = roughly "≥1/6 of a 1080p frame's height" — hero/foreground faces. Below
-# that the restorer cost outweighs the perceptual gain, especially under
-# gender-mode crowd swaps where DET_SIZE=800 picks up many small background
-# faces (was 90 → caused ~20 enhanced faces/frame and 0.1 fps on crowd jobs).
-export FACESWAP_ENHANCER_MIN_FACE="${FACESWAP_ENHANCER_MIN_FACE:-180}"
-# CodeFormer is the costliest stage (second 512px restorer). Raise its floor
-# above GFPGAN's so the chained stack only runs on hero faces; the swap +
-# GFPGAN is plenty for mid-sized faces.
-export FACESWAP_CODEFORMER_MIN_FACE="${FACESWAP_CODEFORMER_MIN_FACE:-220}"
+export FACESWAP_ENHANCER_MIN_FACE="${FACESWAP_ENHANCER_MIN_FACE:-90}"
 # Matching: raise the cosine-sim threshold off the very permissive 0.15 default
 # so only confident matches swap (stops swapping onto the wrong person). Too
 # high would drop the real target on hard frames (= flicker), so 0.25 is a
 # balance with the max-over-members matcher.
-# Only used when FACESWAP_MATCH_MODE=identity. Ignored under gender-mode.
 export FACESWAP_REF_THRESH="${FACESWAP_REF_THRESH:-0.25}"
-# Tier 2 crowd-mode (chosen 2026-05-24): swap EVERY detected face using a
-# same-gender avatar (cycling when more faces of that gender than avatars).
-# No similarity threshold, so faces beyond the uploaded avatar count are still
-# fully swapped. Set FACESWAP_MATCH_MODE=identity to fall back to the cluster +
-# cosine-sim path that only swaps recognised identities.
-export FACESWAP_MATCH_MODE="${FACESWAP_MATCH_MODE:-gender}"
-# Detection NMS: suppress duplicate boxes for the same physical face (their
-# overlapping soft paste masks were the source of multi-face paste-bleed).
-# 0.5 keeps genuinely adjacent people, drops only true duplicates.
-export FACESWAP_NMS_IOU="${FACESWAP_NMS_IOU:-0.5}"
 # Slightly weaker LAB colour transfer -> the swapped face's colour shifts less
 # frame-to-frame (reduces shimmer/flicker) while still blending into the scene.
 export FACESWAP_COLOR_STRENGTH="${FACESWAP_COLOR_STRENGTH:-0.5}"
@@ -186,7 +124,6 @@ done
 
 if port_in_use; then
   print_links
-  ensure_stats_daemon
 else
   echo "ERROR: server did not bind port ${PORT} within 120s. Last log lines:"
   tail -n 30 "$LOG"
