@@ -229,43 +229,60 @@ class FramePool:
 # FACESWAP_ENHANCER=0 disables GFPGAN. Prod (v1) is unaffected.
 
 
-def _match_faces_to_sources(sims, thresh):
+def _match_faces_to_sources(sims, thresh, tgt_faces=None, ref_sources=None):
     """One-to-one face<->source assignment per frame. Returns [(face_i, src_i)].
 
-    Replaces plain per-face argmax, which left the female source unused (and the
-    actress's face skipped) whenever the male match was stronger. When #faces ==
-    #sources (the duet case) every source is forced onto a distinct face with no
-    threshold, so the female face is always swapped; otherwise each source claims
-    its best distinct face above threshold, then extra faces match their best
-    source above threshold (crowds / repeated identities).
+    Strict 1:1 in identity mode: each source matches at most ONE face per frame,
+    and each face matches at most ONE source. When #faces == #sources (duet case)
+    every source is forced onto a distinct face with no threshold; otherwise each
+    source claims its best distinct face above threshold.
+
+    Gender lock (when `tgt_faces` and `ref_sources` are provided): cross-gender
+    pairs are hard-rejected — male avatar never lands on a female face and vice
+    versa. The detector's gender label is treated as a hint: if it says nothing
+    ('?' / None), the pair is NOT blocked.
     """
     import numpy as _np
 
     T, S = sims.shape
+    sims_eff = sims
+    # Mask cross-gender pairs to -inf so they never win the descending-sim race.
+    if tgt_faces is not None and ref_sources is not None and len(tgt_faces) == T:
+        src_g = [r.get("gender") if isinstance(r, dict) else getattr(r, "gender", None)
+                 for r in ref_sources]
+        face_g = [getattr(f, "sex", None) for f in tgt_faces]
+        mask_needed = any(sg in ("M", "F") for sg in src_g)
+        if mask_needed:
+            sims_eff = sims.copy()
+            for ti in range(T):
+                fg = face_g[ti]
+                if not fg:
+                    continue   # detector unsure -> don't block
+                for si in range(S):
+                    sg = src_g[si]
+                    if sg in ("M", "F") and sg != fg:
+                        sims_eff[ti, si] = -1e9
     out = []
     face_taken = [False] * T
     src_used = [False] * S
     force = (T == S)
     order = _np.dstack(
-        _np.unravel_index(_np.argsort(sims, axis=None)[::-1], sims.shape)
+        _np.unravel_index(_np.argsort(sims_eff, axis=None)[::-1], sims_eff.shape)
     )[0]
     for pair in order:
         ti, si = int(pair[0]), int(pair[1])
         if face_taken[ti] or src_used[si]:
             continue
-        if (not force) and float(sims[ti, si]) < thresh:
+        s = float(sims_eff[ti, si])
+        if s <= -1e8:
+            continue   # cross-gender — skip
+        if (not force) and s < thresh:
             break
         out.append((ti, si))
         face_taken[ti] = True
         src_used[si] = True
         if all(src_used) or all(face_taken):
             break
-    for ti in range(T):
-        if face_taken[ti]:
-            continue
-        si = int(_np.argmax(sims[ti]))
-        if float(sims[ti, si]) >= thresh:
-            out.append((ti, si))
     return out
 
 
@@ -278,26 +295,38 @@ def _match_faces_by_gender(tgt_faces, ref_sources):
     Used when FACESWAP_MATCH_MODE=gender (the "swap everyone" crowd-mode requested
     2026-05-24). No similarity threshold — every face is assigned to some source,
     so crowds beyond the uploaded avatar count are still fully swapped.
+
+    Face order inside each gender bucket is sorted by bbox center-x (left-to-right)
+    so the same physical person keeps the same avatar across frames. InsightFace's
+    detection order is NOT stable frame-to-frame — without this sort, a counter-
+    based assignment flips avatars between adjacent people whenever the detector
+    re-orders them, which looks like the swap "jumping" person-to-person.
     """
     pool_by_gender = {"M": [], "F": []}
     for si, src in enumerate(ref_sources):
         pool_by_gender.setdefault(src.get("gender") or "M", []).append(si)
-    counters = {"M": 0, "F": 0, "_": 0}
     fallback = list(range(len(ref_sources)))
-    out = []
+
+    buckets = {"M": [], "F": [], "_": []}
     for ti, face in enumerate(tgt_faces):
         g = getattr(face, "sex", None)
-        pool = pool_by_gender.get(g) if g else None
+        key = g if g in ("M", "F") else "_"
+        x1, _, x2, _ = face.bbox
+        cx = (float(x1) + float(x2)) * 0.5
+        buckets[key].append((cx, ti))
+
+    out = []
+    for key, entries in buckets.items():
+        if not entries:
+            continue
+        pool = pool_by_gender.get(key) if key in ("M", "F") else None
         if not pool:
             pool = fallback
-            key = "_"
-        else:
-            key = g
         if not pool:
             continue
-        si = pool[counters[key] % len(pool)]
-        counters[key] += 1
-        out.append((ti, si))
+        entries.sort(key=lambda e: e[0])
+        for idx, (_, ti) in enumerate(entries):
+            out.append((ti, pool[idx % len(pool)]))
     return out
 
 
@@ -811,7 +840,10 @@ def worker_main(
                                     sims[:, s] = all_sims[:, cols].max(axis=1)
                         else:
                             sims = tgt_embs @ ref_embs_T      # fallback to centroid sim
-                        pairs = _match_faces_to_sources(sims, ref_thresh)
+                        pairs = _match_faces_to_sources(
+                            sims, ref_thresh,
+                            tgt_faces=tgt_faces, ref_sources=ref_sources,
+                        )
 
                     # Snapshot original pixels: every swap reads from `orig` so
                     # an already-pasted face cannot bleed into the swap computed

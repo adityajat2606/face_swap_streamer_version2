@@ -431,14 +431,37 @@ class _SourceTracker:
     FACESWAP_CARRY_FRAMES, FACESWAP_TRACK_IOU.
     """
 
-    def __init__(self, n_sources: int, ref_thresh: float):
+    def __init__(self, n_sources: int, ref_thresh: float, source_genders=None):
         self.S = n_sources
         self.ref_thresh = ref_thresh
         self.sticky = max(ref_thresh * float(os.getenv("FACESWAP_STICKY_FACTOR", "0.5")), 0.05)
         self.carry_frames = int(os.getenv("FACESWAP_CARRY_FRAMES", "5"))
         self.iou_gate = float(os.getenv("FACESWAP_TRACK_IOU", "0.3"))
+        # Two-tier threshold: a STRICT bar to first-acquire a source onto a
+        # face (so a bystander whose sim accidentally clears the loose ref_thresh
+        # doesn't grab the avatar when the real lead isn't in frame), and a LOOSE
+        # bar to maintain an existing lock through borderline frames.
+        self.cold_lock_thresh = float(
+            os.getenv("FACESWAP_COLD_LOCK_THRESH", str(max(ref_thresh * 2.0, 0.35)))
+        )
         self.last_bbox: list = [None] * n_sources
         self.misses: list = [10 ** 9] * n_sources
+        # Per-source target gender. When provided, a source is NEVER assigned
+        # to a face of mismatching gender (kills the bug where the male avatar
+        # occasionally landed on a female face due to embedding-noise crossing
+        # in the greedy 1:1 step). Detector gender is unreliable (~30% wrong
+        # on profile / lighting), so face-side genders are treated as a hint:
+        # if the detector says nothing, we DON'T block the pair.
+        self.src_genders: list = list(source_genders) if source_genders else [None] * n_sources
+
+    def _gender_ok(self, ti_face, si: int) -> bool:
+        want = self.src_genders[si]
+        if not want:
+            return True
+        got = getattr(ti_face, "sex", None)
+        if not got:                                    # detector unsure -> allow
+            return True
+        return got == want
 
     def _warm(self, si: int) -> bool:
         return self.misses[si] <= self.carry_frames and self.last_bbox[si] is not None
@@ -455,18 +478,53 @@ class _SourceTracker:
         force = (T == S)                  # duet: every source must be applied
 
         def acceptable(ti, si):
+            if not self._gender_ok(tgt_faces[ti], si):
+                return False
             if force:
                 return True
             s = float(sims[ti, si])
-            if s >= self.ref_thresh:
-                return True
-            # locked + still in roughly the same place + not collapsed -> keep it
-            if self._warm(si) and s >= self.sticky \
-                    and _bbox_iou(bb[ti], self.last_bbox[si]) >= self.iou_gate:
-                return True
-            return False
+            if self._warm(si):
+                # warm: maintain the lock through borderline frames
+                if s >= self.ref_thresh:
+                    return True
+                if s >= self.sticky \
+                        and _bbox_iou(bb[ti], self.last_bbox[si]) >= self.iou_gate:
+                    return True
+                return False
+            # cold: require a STRONG sim to first-acquire a source. Stops a
+            # bystander whose sim accidentally crosses the loose ref_thresh from
+            # grabbing the avatar when the actual lead is off-screen.
+            return s >= self.cold_lock_thresh
 
-        # phase 1: greedy one-to-one by descending similarity, with hysteresis
+        # phase 0 (NEW): spatial lock-in for warm sources. Each warm source
+        # claims the face sitting at its last_bbox (best IoU above the gate)
+        # BEFORE sim-based matching gets a chance to mis-assign it. Without
+        # this, a noisy frame where a bystander's sim accidentally beat the
+        # actress's would let phase 1 grab the bystander first, and `src_used`
+        # then blocked phase 2 from rescuing the swap onto the actress's
+        # warm bbox. Spatial continuity is the strongest identity signal we
+        # have once we've locked on, so we trust it first.
+        for si in range(S):
+            if not self._warm(si):
+                continue
+            best_ti, best_iou = -1, self.iou_gate
+            for ti in range(T):
+                if face_taken[ti]:
+                    continue
+                if not self._gender_ok(tgt_faces[ti], si):
+                    continue
+                iou = _bbox_iou(bb[ti], self.last_bbox[si])
+                if iou >= best_iou:
+                    best_iou, best_ti = iou, ti
+            if best_ti >= 0:
+                picks.append((tgt_faces[best_ti], si))
+                face_taken[best_ti] = True
+                src_used[si] = True
+                primary[si] = bb[best_ti]
+
+        # phase 1: greedy one-to-one by descending similarity, with hysteresis.
+        # Gender filter is enforced in acceptable() so a cross-gender pair is
+        # always rejected even when sim happens to be highest.
         order = np.dstack(
             np.unravel_index(np.argsort(sims, axis=None)[::-1], sims.shape)
         )[0]
@@ -479,13 +537,16 @@ class _SourceTracker:
             if all(src_used) or all(face_taken):
                 break
 
-        # phase 2: spatial carry-through for a warm source the embedding lost
+        # phase 2: spatial carry-through for any warm source still unmatched
+        # after phase 0+1 (rare — usually phase 0 already handled them).
         for si in range(S):
             if src_used[si] or not self._warm(si):
                 continue
             best_ti, best_iou = -1, self.iou_gate
             for ti in range(T):
                 if face_taken[ti]:
+                    continue
+                if not self._gender_ok(tgt_faces[ti], si):
                     continue
                 iou = _bbox_iou(bb[ti], self.last_bbox[si])
                 if iou >= best_iou:
@@ -494,13 +555,12 @@ class _SourceTracker:
                 picks.append((tgt_faces[best_ti], si))
                 face_taken[best_ti] = True; src_used[si] = True; primary[si] = bb[best_ti]
 
-        # phase 3: extra faces (repeated identity / crowd) -> best source
-        for ti in range(T):
-            if face_taken[ti]:
-                continue
-            si = int(np.argmax(sims[ti]))
-            if float(sims[ti, si]) >= self.ref_thresh:
-                picks.append((tgt_faces[ti], si)); face_taken[ti] = True
+        # phase 3 (REMOVED): used to assign every still-unmatched face to its
+        # best source above threshold, intended for repeated-identity crowds.
+        # In single-actor mode (S=1) this meant every bystander whose sim happened
+        # to clear the threshold also got the avatar — which is exactly the
+        # "avatar leaks onto everyone" bug the user kept reporting. Strict 1:1
+        # (phase 1 + phase 2 only) keeps the avatar on the tracked actor/actress.
 
         # update temporal state from the primary (one-to-one / carry) matches
         for si in range(S):
@@ -771,7 +831,10 @@ def _run_job(job: Job):
             # Temporal tracker: keeps each source locked onto its face across
             # frames (hysteresis + spatial carry-through) so the swap doesn't
             # blink on/off as the face turns. Frames are processed in order here.
-            tracker = _SourceTracker(len(ref_sources), REFERENCE_THRESH)
+            tracker = _SourceTracker(
+                len(ref_sources), REFERENCE_THRESH,
+                source_genders=[s.gender for s in ref_sources],
+            )
             try:
                 while True:
                     item = read_q.get()
@@ -1872,6 +1935,7 @@ if __name__ == "__main__":
     _cleanup_old_jobs()
     # Pre-warm models in a background thread so the first job is faster.
     threading.Thread(target=_ensure_models, daemon=True).start()
-    print("[webapp] starting on http://localhost:8080/  (jobs at " + JOBS_DIR + ")", flush=True)
+    _port = int(os.getenv("FACESWAP_PORT", "8080"))
+    print(f"[webapp] starting on http://localhost:{_port}/  (jobs at " + JOBS_DIR + ")", flush=True)
     # Threaded server so the long-poll MJPEG stream doesn't block other requests.
-    app.run(host="0.0.0.0", port=8080, threaded=True, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=_port, threaded=True, debug=False, use_reloader=False)

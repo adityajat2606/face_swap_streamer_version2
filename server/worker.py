@@ -71,7 +71,8 @@ class SourceSpec:
     gender: str = ""
     age: int = 0
     src_face: object = None         # insightface Face — kept alive for swap
-    ref_emb: object = None          # numpy embedding of matching cluster
+    ref_emb: object = None          # numpy embedding of matching cluster (centroid-ish)
+    ref_members: object = None      # numpy (M, D) — all cluster member embeddings
     ref_frame: int = -1
     ref_votes: int = 0
     ref_pool: int = 0
@@ -391,6 +392,15 @@ def extract_reference_embeddings(job: Job) -> None:
                 spec.ref_votes = int((sim[local_winner] > 0.30).sum())
                 spec.ref_pool = len(same_gender)
                 similar = sim[local_winner] > 0.30
+                # Stash every candidate that clustered with the winner as
+                # `ref_members`. The streaming matcher uses max-over-members
+                # sim, which is far more stable across pose / lighting than
+                # centroid-only — without this the actress flickers whenever
+                # her angle drifts past the single reference frame.
+                member_embs = [same_gender[j][1][1]
+                               for j in range(len(same_gender)) if similar[j]]
+                spec.ref_members = (np.stack(member_embs).astype(np.float32)
+                                    if member_embs else cand[1][None, :].astype(np.float32))
                 for j, (gidx, _) in enumerate(same_gender):
                     if similar[j]:
                         used_idxs.add(gidx)
@@ -445,6 +455,22 @@ def run_streaming(job: Job) -> None:
         finally:
             read_q.put(END)
 
+    # Build per-source stacked cluster members + index map once. Max-over-members
+    # sim is far more pose/lighting-stable than centroid-only — without this the
+    # actress flickers whenever her angle drifts from the single ref frame.
+    members_per_src = [getattr(s, "ref_members", None) for s in job.sources]
+    if all(m is not None and getattr(m, "size", 0) > 0 for m in members_per_src):
+        stacked = np.concatenate(members_per_src, axis=0).astype(np.float32)
+        source_idx_map = np.concatenate(
+            [np.full(m.shape[0], si, dtype=np.int32)
+             for si, m in enumerate(members_per_src)]
+        )
+        stacked_T = stacked.T
+    else:
+        stacked_T = None
+        source_idx_map = None
+    S = len(job.sources)
+
     def _detect_loop():
         try:
             while True:
@@ -455,12 +481,42 @@ def run_streaming(job: Job) -> None:
                 tgt_faces = fa.get(frame)
                 picks = []
                 if tgt_faces:
-                    tgt_embs = np.stack([f.normed_embedding for f in tgt_faces])
-                    sims = tgt_embs @ ref_embs.T
-                    for ti, tface in enumerate(tgt_faces):
-                        si = int(np.argmax(sims[ti]))
-                        if float(sims[ti, si]) >= REFERENCE_THRESH:
-                            picks.append((tface, si))
+                    tgt_embs = np.stack(
+                        [f.normed_embedding for f in tgt_faces]
+                    ).astype(np.float32)
+                    if stacked_T is not None:
+                        all_sims = tgt_embs @ stacked_T          # (T, sum_M)
+                        sims = np.full((len(tgt_faces), S), -1.0, dtype=np.float32)
+                        for si in range(S):
+                            cols = (source_idx_map == si)
+                            if cols.any():
+                                sims[:, si] = all_sims[:, cols].max(axis=1)
+                    else:
+                        sims = tgt_embs @ ref_embs.T              # centroid fallback
+                    # Strict 1:1 (greedy, globally ordered): each source claims
+                    # at most ONE face per frame, each face at most ONE source.
+                    # Stops the avatar from leaking onto bystanders whose sims
+                    # happen to clear the threshold — only the BEST match for
+                    # each source gets the swap.
+                    T = len(tgt_faces)
+                    face_taken = [False] * T
+                    src_used = [False] * S
+                    order = np.dstack(
+                        np.unravel_index(
+                            np.argsort(sims, axis=None)[::-1], sims.shape
+                        )
+                    )[0]
+                    for pair in order:
+                        ti, si = int(pair[0]), int(pair[1])
+                        if face_taken[ti] or src_used[si]:
+                            continue
+                        if float(sims[ti, si]) < REFERENCE_THRESH:
+                            break
+                        picks.append((tgt_faces[ti], si))
+                        face_taken[ti] = True
+                        src_used[si] = True
+                        if all(src_used) or all(face_taken):
+                            break
                 detect_q.put((frame, picks))
         finally:
             detect_q.put(END)

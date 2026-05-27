@@ -149,17 +149,26 @@ export FACESWAP_CODEFORMER_MIN_FACE="${FACESWAP_CODEFORMER_MIN_FACE:-220}"
 # high would drop the real target on hard frames (= flicker), so 0.25 is a
 # balance with the max-over-members matcher.
 # Only used when FACESWAP_MATCH_MODE=identity. Ignored under gender-mode.
-export FACESWAP_REF_THRESH="${FACESWAP_REF_THRESH:-0.25}"
-# Tier 2 crowd-mode (chosen 2026-05-24): swap EVERY detected face using a
-# same-gender avatar (cycling when more faces of that gender than avatars).
-# No similarity threshold, so faces beyond the uploaded avatar count are still
-# fully swapped. Set FACESWAP_MATCH_MODE=identity to fall back to the cluster +
-# cosine-sim path that only swaps recognised identities.
-export FACESWAP_MATCH_MODE="${FACESWAP_MATCH_MODE:-gender}"
+export FACESWAP_REF_THRESH="${FACESWAP_REF_THRESH:-0.18}"
+# Match mode (default = identity, chosen 2026-05-27): swap ONLY faces that
+# resemble the uploaded source's identity (cluster + cosine-sim, threshold above).
+# The uploaded avatar stays on the actor/actress, not on every bystander in frame.
+# Set FACESWAP_MATCH_MODE=gender to opt back into the Tier 2 "swap-everyone-by-
+# same-gender" crowd mode (cycles avatars across all detected same-gender faces,
+# no similarity threshold).
+export FACESWAP_MATCH_MODE="${FACESWAP_MATCH_MODE:-identity}"
 # Detection NMS: suppress duplicate boxes for the same physical face (their
 # overlapping soft paste masks were the source of multi-face paste-bleed).
 # 0.5 keeps genuinely adjacent people, drops only true duplicates.
 export FACESWAP_NMS_IOU="${FACESWAP_NMS_IOU:-0.5}"
+# webapp.py temporal tracker tunables. Defaults were too strict for fast head
+# turns / quick movement — actress dropped out of the lock when her bbox moved
+# more than 30% IoU between frames OR when she went undetected for >5 frames.
+# Looser values: lock keeps holding through bigger pose jumps + brief detector
+# misses, eliminating the flicker. Identity stays anchored via IoU continuity.
+export FACESWAP_TRACK_IOU="${FACESWAP_TRACK_IOU:-0.15}"
+export FACESWAP_CARRY_FRAMES="${FACESWAP_CARRY_FRAMES:-10}"
+export FACESWAP_STICKY_FACTOR="${FACESWAP_STICKY_FACTOR:-0.3}"
 # Slightly weaker LAB colour transfer -> the swapped face's colour shifts less
 # frame-to-frame (reduces shimmer/flicker) while still blending into the scene.
 export FACESWAP_COLOR_STRENGTH="${FACESWAP_COLOR_STRENGTH:-0.5}"
